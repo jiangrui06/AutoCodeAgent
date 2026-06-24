@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s --connect-timeout 10 --max-time 120 -X POST https://api.siliconflow.cn/v1/chat/completions -H 'Authorization: Bearer sk-iidessrajjeosggbtoscoqnrrmitwytefrxskrxoezjwgqmc' -H 'Content-Type: application/json' -d '{\"model\":\"deepseek-ai/DeepSeek-V4-Pro\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a simple Python hello world function\"}],\"max_tokens\":100}')",
+      "Bash(python app_web.py)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /F /PID 33584)",
+      "Bash(taskkill *)",
+      "Bash(python -u app_web.py)",
+      "Bash(curl *)"
+    ]
+  }
+}
