@@ -46,13 +46,21 @@ def safe_execute_code(code_str: str, timeout: int = 15) -> tuple[str, str]:
         tmp.write(code_str)
         tmp.close()  # 确保刷入磁盘
 
+        # Windows 下降低子进程 CPU 优先级，避免生成代码占满整机
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
         # 子进程执行
         # -I 隔离模式：忽略 PYTHON* 环境变量，不加载用户 site-packages
         proc = subprocess.run(
             [sys.executable, "-I", tmp.name],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
+            **kwargs,
         )
 
         stdout = proc.stdout or ""

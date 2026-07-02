@@ -9,7 +9,12 @@
       "Bash(taskkill /F /PID 33584)",
       "Bash(taskkill *)",
       "Bash(python -u app_web.py)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "Read(//d/简历/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(where python *)",
+      "Bash(py --list)",
+      "Bash(py *)"
     ]
   }
 }

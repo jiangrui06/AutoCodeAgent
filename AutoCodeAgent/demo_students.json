@@ -1,0 +1,16 @@
+[
+  {
+    "student_id": "002",
+    "name": "TestStudent2",
+    "scores": [
+      {
+        "subject": "Math",
+        "score": 80.0
+      },
+      {
+        "subject": "English",
+        "score": 70.0
+      }
+    ]
+  }
+]

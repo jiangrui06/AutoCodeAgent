@@ -123,11 +123,52 @@ _SUSPICIOUS_VAR_NAMES = [
 ]
 
 
+def _has_break_or_return(node: ast.AST) -> bool:
+    """检查循环体中是否存在 break/return（粗略判断是否为无限循环）"""
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Break, ast.Return)):
+            return True
+    return False
+
+
 def _ast_scan(tree: ast.AST, source_lines: list[str]) -> list[Finding]:
     """基于 AST 的结构化扫描"""
     findings = []
 
     for node in ast.walk(tree):
+        # ── 检测明显的无限循环 / 高 CPU 模式 ──
+        if isinstance(node, ast.While):
+            # while True / while 1 / while False is not False 等恒真条件
+            cond = node.test
+            is_always_true = (
+                (isinstance(cond, ast.Constant) and cond.value is True)
+                or (isinstance(cond, ast.Constant) and cond.value == 1)
+                or (isinstance(cond, ast.Compare) and len(cond.ops) == 1
+                    and isinstance(cond.ops[0], ast.Eq))
+            )
+            if is_always_true and not _has_break_or_return(node):
+                findings.append(Finding(
+                    risk=HIGH,
+                    title="疑似无限循环",
+                    detail="检测到 `while True` 且循环体内无 break/return，可能导致 CPU 100% 占用",
+                    line_no=getattr(node, "lineno", None),
+                ))
+
+        if isinstance(node, ast.For):
+            # for _ in range(极大数字)
+            if (isinstance(node.iter, ast.Call)
+                    and _get_call_name(node.iter) == "range"
+                    and len(node.iter.args) >= 1
+                    and isinstance(node.iter.args[0], ast.Constant)
+                    and isinstance(node.iter.args[0].value, int)
+                    and node.iter.args[0].value >= 100_000):
+                findings.append(Finding(
+                    risk=MEDIUM,
+                    title="大范围循环",
+                    detail=f"检测到 `range({node.iter.args[0].value})`，可能导致执行缓慢或高 CPU",
+                    line_no=getattr(node, "lineno", None),
+                ))
+
         # ── 检测危险函数调用 ──
         if isinstance(node, ast.Call):
             func = _get_call_name(node)
