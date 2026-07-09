@@ -5,6 +5,7 @@ import sys
 
 from langchain_core.prompts import PromptTemplate
 
+from code_linter import lint_code
 from code_sandbox import safe_execute_code
 from code_scanner import (
     FORCE_RUN_MARKER,
@@ -104,22 +105,44 @@ FIXER_PROMPT = PromptTemplate.from_template("""
 # 提取代码块工具
 # ════════════════════════════════════════════════════
 
-_CODE_BLOCK_PATTERN = re.compile(r"```python\s*\n(.*?)```", re.DOTALL)
+_CODE_BLOCK_PATTERN = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_GENERIC_BLOCK_PATTERN = re.compile(r"```\s*\n(.*?)```", re.DOTALL)
+
+
+def _looks_like_python(code: str) -> bool:
+    """粗略判断文本是否像 Python 代码"""
+    indicators = [
+        "def ", "class ", "import ", "from ",
+        "if __name__", "print(", "return ", "for ", "while ",
+    ]
+    code_lower = code.lower()
+    return any(ind in code_lower for ind in indicators)
 
 
 def _extract_code(text: str) -> str:
-    """从 LLM 回复中提取 ```python 代码块，不支持裸文本"""
-    # 主匹配：```python ... ```
+    """从 LLM 回复中提取 Python 代码块
+
+    支持 ```python、```py、```（无语言标记）以及裸代码文本。
+    """
+    # 1. 主匹配：```python / ```py
     match = _CODE_BLOCK_PATTERN.search(text)
     if match:
         return match.group(1).strip()
-    # fallback：``` ... ```（无语言标记）
-    fallback = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
-    if fallback:
-        return fallback.group(1).strip()
-    # 兜底：完全找不到代码块，抛异常避免把 Markdown 当代码执行
+
+    # 2. fallback：``` ... ```（无语言标记），取第一个看起来像 Python 的
+    for block in _GENERIC_BLOCK_PATTERN.findall(text):
+        block = block.strip()
+        if _looks_like_python(block):
+            return block
+
+    # 3. 兜底：没有代码块，但整体看起来像 Python 裸代码
+    stripped = text.strip()
+    if _looks_like_python(stripped):
+        return stripped
+
+    # 4. 完全不是代码，报错
     raise ValueError(
-        "LLM 输出中未找到有效的 ```python 代码块，无法提取代码。"
+        "LLM 输出中未找到有效的 Python 代码块，无法提取代码。"
         f"原始输出前 200 字：\n{text[:200]}"
     )
 
@@ -151,8 +174,16 @@ def coder_node(state) -> dict:
 
 
 def executor_node(state) -> dict:
-    """3. 子进程执行节点：安全扫描 → 隔离执行并捕获输出"""
+    """3. 子进程执行节点：静态检查 → 安全扫描 → 隔离执行并捕获输出"""
     code = state.code
+
+    # ── 静态检查：先抓语法/未定义名，避免直接跑子进程浪费 Token ──
+    lint_ok, lint_msg = lint_code(code)
+    if not lint_ok:
+        return {
+            "exec_stdout": "",
+            "exec_stderr": f"[Lint] {lint_msg}\n\n已阻止子进程执行，请让 Agent 修复后再试。",
+        }
 
     # ── 安全检查（除非用户标记强制运行） ──
     if not has_force_run_marker(state.user_requirement + code):
@@ -179,6 +210,10 @@ def executor_node(state) -> dict:
         "exec_stdout": out,
         "exec_stderr": err,
     }
+
+    # 把非阻塞的 lint 警告追加到 stderr 末尾，便于查看
+    if lint_msg:
+        updates["exec_stderr"] = (err + "\n" + lint_msg).strip()
 
     return updates
 

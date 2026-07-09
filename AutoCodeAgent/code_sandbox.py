@@ -17,17 +17,22 @@ import tempfile
 import subprocess
 import traceback
 
+from config import settings
 
-def safe_execute_code(code_str: str, timeout: int = 15) -> tuple[str, str]:
+
+def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
     """在子进程中执行 Python 代码并捕获输出
 
     Args:
         code_str: Python 代码文本
-        timeout: 超时秒数（默认 15s，简单程序通常 1-3s，复杂程序可能需要 10s+）
+        timeout: 超时秒数，默认从 .env 的 SANDBOX_TIMEOUT 读取（默认 15s）
 
     Returns:
         (stdout, stderr)
     """
+    if timeout is None:
+        timeout = settings.sandbox_timeout
+
     # 语法预检（快速失败，避免写到磁盘）
     try:
         compile(code_str, "<pre-check>", "exec")

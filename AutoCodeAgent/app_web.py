@@ -8,8 +8,9 @@
 
 import gradio as gr
 
-from file_util import get_all_generated_files, get_latest_code_file, save_code_to_file
+from file_util import get_all_generated_files, save_code_to_file
 from graph_nodes import coder_node, executor_node, fixer_node, judge_route, planner_node
+from logger import logger
 from state_model import CodeAgentState
 
 # ── 常量 ──
@@ -56,89 +57,101 @@ def run_agent(requirement: str):
     不使用 gr.Progress()（其 DOM overlay 会遮盖输出文字），
     改用 yield 消息头部内嵌进度指示。
     """
-    if not requirement or not requirement.strip():
-        yield "请输入有效的开发需求。"
-        return
+    try:
+        if not requirement or not requirement.strip():
+            yield "请输入有效的开发需求。"
+            return
 
-    state = CodeAgentState(user_requirement=requirement)
+        logger.info(f"Web 收到需求: {requirement}")
+        state = CodeAgentState(user_requirement=requirement)
 
-    steps_total = 3 + state.max_retry * 2  # plan + code + (exec+fix)×N
-    step_index = 0
+        steps_total = 3 + state.max_retry * 2  # plan + code + (exec+fix)×N
+        step_index = 0
 
-    # ── Step 1: Planner ──
-    step_index += 1
-    _apply_updates(state, planner_node(state))
-    plan_text = state.dev_plan[:600] + ("..." if len(state.dev_plan) > 600 else "")
-    yield (
-        f"> **进度** `[{step_index}/{steps_total}]` 📋 规划中...\n\n"
-        f"## 📋 开发方案\n```\n{plan_text}\n```\n\n---\n"
-    )
-
-    # ── Step 2: Coder ──
-    step_index += 1
-    _apply_updates(state, coder_node(state))
-    code_snippet = state.code[:800] + ("..." if len(state.code) > 800 else "")
-    yield (
-        f"> **进度** `[{step_index}/{steps_total}]` ✏️ 编码中...\n\n"
-        f"## ✏️ 生成代码（首版）\n```python\n{code_snippet}\n```\n\n---\n"
-    )
-
-    # ── Step 3-5: Executor → Judge → Fixer 循环 ──
-    iteration = 0
-    while iteration <= state.max_retry:
-        # Executor
+        # ── Step 1: Planner ──
         step_index += 1
-        _apply_updates(state, executor_node(state))
-
-        has_error = bool(state.exec_stderr.strip())
-
-        if has_error:
-            msg = (
-                f"> **进度** `[{step_index}/{steps_total}]` ▶️ 第 {iteration + 1} 次执行...\n\n"
-                f"## ▶️ 第 {iteration + 1} 次执行结果\n"
-                f"**状态：❌ 报错**\n"
-                f"**输出：**\n```\n{state.exec_stdout[:500]}\n```\n"
-                f"**错误：**\n```\n{state.exec_stderr[:500]}\n```\n\n---\n"
-            )
-        else:
-            msg = (
-                f"> **进度** `[{step_index}/{steps_total}]` ✅ 第 {iteration + 1} 次执行成功\n\n"
-                f"## ▶️ 第 {iteration + 1} 次执行结果\n"
-                f"**状态：✅ 执行成功**\n"
-                f"**输出：**\n```\n{state.exec_stdout[:500]}\n```\n\n---\n"
-            )
-        yield msg
-
-        # Judge — 决定分支
-        route = judge_route(state)
-
-        if not has_error:
-            break
-
-        if state.retry_times >= state.max_retry:
-            break
-
-        # Fixer
-        iteration += 1
-        step_index += 1
-        _apply_updates(state, fixer_node(state))
-        fix_snippet = state.code[:500] + ("..." if len(state.code) > 500 else "")
+        _apply_updates(state, planner_node(state))
+        plan_text = state.dev_plan[:600] + ("..." if len(state.dev_plan) > 600 else "")
         yield (
-            f"> **进度** `[{step_index}/{steps_total}]` 🔧 第 {iteration} 次修复中...\n\n"
-            f"## 🔧 第 {iteration} 次修复\n"
-            f"修复后代码：\n```python\n{fix_snippet}\n```\n\n---\n"
+            f"> **进度** `[{step_index}/{steps_total}]` 📋 规划中...\n\n"
+            f"## 📋 开发方案\n```\n{plan_text}\n```\n\n---\n"
         )
 
-    # ── 结束 ──
-    save_path = ""
-    if state.code:
-        save_path = save_code_to_file(state.code, phase="final")
+        # ── Step 2: Coder ──
+        step_index += 1
+        _apply_updates(state, coder_node(state))
+        code_snippet = state.code[:800] + ("..." if len(state.code) > 800 else "")
+        yield (
+            f"> **进度** `[{step_index}/{steps_total}]` ✏️ 编码中...\n\n"
+            f"## ✏️ 生成代码（首版）\n```python\n{code_snippet}\n```\n\n---\n"
+        )
 
-    final = f"> **进度** `[✓ 完成]` 🎉 任务结束\n\n---\n"
-    final += format_output(state)
-    if save_path:
-        final += f"\n📁 代码已保存至：{save_path}"
-    yield final
+        # ── Step 3-5: Executor → Judge → Fixer 循环 ──
+        iteration = 0
+        while iteration <= state.max_retry:
+            # Executor
+            step_index += 1
+            _apply_updates(state, executor_node(state))
+
+            has_error = bool(state.exec_stderr.strip())
+
+            if has_error:
+                msg = (
+                    f"> **进度** `[{step_index}/{steps_total}]` ▶️ 第 {iteration + 1} 次执行...\n\n"
+                    f"## ▶️ 第 {iteration + 1} 次执行结果\n"
+                    f"**状态：❌ 报错**\n"
+                    f"**输出：**\n```\n{state.exec_stdout[:500]}\n```\n"
+                    f"**错误：**\n```\n{state.exec_stderr[:500]}\n```\n\n---\n"
+                )
+            else:
+                msg = (
+                    f"> **进度** `[{step_index}/{steps_total}]` ✅ 第 {iteration + 1} 次执行成功\n\n"
+                    f"## ▶️ 第 {iteration + 1} 次执行结果\n"
+                    f"**状态：✅ 执行成功**\n"
+                    f"**输出：**\n```\n{state.exec_stdout[:500]}\n```\n\n---\n"
+                )
+            yield msg
+
+            # Judge — 决定分支
+            judge_route(state)
+
+            if not has_error:
+                break
+
+            if state.retry_times >= state.max_retry:
+                break
+
+            # Fixer
+            iteration += 1
+            step_index += 1
+            _apply_updates(state, fixer_node(state))
+            fix_snippet = state.code[:500] + ("..." if len(state.code) > 500 else "")
+            yield (
+                f"> **进度** `[{step_index}/{steps_total}]` 🔧 第 {iteration} 次修复中...\n\n"
+                f"## 🔧 第 {iteration} 次修复\n"
+                f"修复后代码：\n```python\n{fix_snippet}\n```\n\n---\n"
+            )
+
+        # ── 结束 ──
+        save_path = ""
+        if state.code:
+            save_path = save_code_to_file(state.code, phase="final")
+
+        final = f"> **进度** `[✓ 完成]` 🎉 任务结束\n\n---\n"
+        final += format_output(state)
+        if save_path:
+            final += f"\n📁 代码已保存至：{save_path}"
+        logger.info(f"Web 任务完成，代码保存至: {save_path}")
+        yield final
+
+    except Exception as e:
+        logger.exception("Web 执行异常")
+        yield (
+            f"## ❌ 执行出错\n\n"
+            f"**错误类型：** `{type(e).__name__}`\n\n"
+            f"**错误信息：**\n```\n{e}\n```\n\n"
+            f"请查看终端日志（`logs/autocode-agent.log`）获取详细堆栈。"
+        )
 
 
 def list_generated_files() -> str:

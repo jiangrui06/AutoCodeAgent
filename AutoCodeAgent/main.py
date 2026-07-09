@@ -8,8 +8,9 @@
 import sys
 import time
 
-from file_util import get_latest_code_file, save_code_to_file
+from file_util import save_code_to_file
 from graph_builder import build_code_agent_graph
+from logger import logger
 from state_model import CodeAgentState
 
 
@@ -46,12 +47,15 @@ def run_auto_code_agent(user_req: str) -> dict:
     print(f"  最大重试：{init_state.max_retry} 次 / 执行超时：15 秒")
     print(f"{'=' * 60}\n")
 
+    logger.info(f"开始执行任务: {user_req}")
+
     # 执行（流式输出中间状态）
     start_time = time.time()
 
     final_state = graph.invoke(init_state)
 
     elapsed = time.time() - start_time
+    logger.info(f"任务完成，耗时 {elapsed:.1f}s，重试 {final_state.get('retry_times', 0)} 次")
 
     # ── 结果输出 ──
     print_separator("任务完成")
@@ -78,9 +82,12 @@ def run_auto_code_agent(user_req: str) -> dict:
     if stderr:
         print_separator("最终报错")
         print(stderr[:2000])
+        logger.warning(f"执行存在报错: {stderr[:500]}")
 
     print_separator("最终代码")
     print(code)
+
+    logger.info(f"最终代码已保存: {save_path}")
 
     return final_state
 
