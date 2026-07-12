@@ -20,6 +20,18 @@ import traceback
 from config import settings
 
 
+def _get_console_encoding() -> str:
+    """获取子进程控制台输出编码
+
+    Windows 控制台通常使用 ANSI 代码页（中文系统为 GBK），
+    而 locale.getpreferredencoding() 可能返回 UTF-8，导致解码乱码。
+    因此 Windows 下优先使用 mbcs（即系统 ANSI 代码页）。
+    """
+    if sys.platform == "win32":
+        return "mbcs"
+    return "utf-8"
+
+
 def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
     """在子进程中执行 Python 代码并捕获输出
 
@@ -62,7 +74,7 @@ def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
             [sys.executable, "-I", tmp.name],
             capture_output=True,
             text=True,
-            encoding="utf-8",
+            encoding=_get_console_encoding(),
             errors="replace",
             timeout=timeout,
             **kwargs,
