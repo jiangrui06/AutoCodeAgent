@@ -5,6 +5,7 @@
 """
 
 from pathlib import Path
+import sys
 
 from dotenv import load_dotenv
 from pydantic import AliasChoices, Field
@@ -49,6 +50,36 @@ class Settings(BaseSettings):
     # Agent / 执行配置
     agent_max_retry: int = Field(default=5, ge=1, le=20, alias="AGENT_MAX_RETRY")
     sandbox_timeout: int = Field(default=15, ge=1, le=600, alias="SANDBOX_TIMEOUT")
+    agent_engine: str = Field(default="legacy", alias="AGENT_ENGINE")
+    openhands_max_iterations: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        alias="OPENHANDS_MAX_ITERATIONS",
+    )
+    openhands_workspace_dir: Path = Field(
+        default=PROJECT_DIR / "auto_generated_code",
+        alias="OPENHANDS_WORKSPACE_DIR",
+    )
+    openhands_persistence_dir: Path | None = Field(
+        default=None,
+        alias="OPENHANDS_PERSISTENCE_DIR",
+    )
+    openhands_python: Path | None = Field(default=None, alias="OPENHANDS_PYTHON")
+    agent_execution_python: Path | None = Field(
+        default=None,
+        alias="AGENT_EXECUTION_PYTHON",
+    )
+    openhands_worker_timeout: int = Field(
+        default=1800,
+        ge=30,
+        le=7200,
+        alias="OPENHANDS_WORKER_TIMEOUT",
+    )
+    openhands_vision_models: str = Field(
+        default="sensenova-6.7-flash-lite",
+        alias="OPENHANDS_VISION_MODELS",
+    )
 
     # Web 配置
     web_server_name: str = Field(default="127.0.0.1", alias="WEB_SERVER_NAME")
@@ -84,6 +115,38 @@ class Settings(BaseSettings):
         placeholders = ("your_", "sk-xxx", "here")
         key = self.llm_api_key.strip().lower()
         return bool(key) and not any(value in key for value in placeholders)
+
+    @property
+    def effective_openhands_persistence_dir(self) -> Path:
+        return self.openhands_persistence_dir or self.memory_dir / "OpenHands会话"
+
+    @property
+    def effective_openhands_python(self) -> Path:
+        if self.openhands_python:
+            return self.openhands_python.expanduser()
+        executable = "python.exe" if sys.platform == "win32" else "python"
+        sibling_runtime = (
+            PROJECT_DIR.parent.parent
+            / "software-agent-sdk"
+            / ".venv"
+            / ("Scripts" if sys.platform == "win32" else "bin")
+            / executable
+        )
+        return sibling_runtime if sibling_runtime.exists() else Path(sys.executable)
+
+    @property
+    def effective_agent_execution_python(self) -> Path:
+        """OpenHands TerminalTool 运行和安装项目依赖时使用的解释器。"""
+        if self.agent_execution_python:
+            return self.agent_execution_python.expanduser()
+        executable = "python.exe" if sys.platform == "win32" else "python"
+        project_runtime = (
+            PROJECT_DIR.parent
+            / ".venv"
+            / ("Scripts" if sys.platform == "win32" else "bin")
+            / executable
+        )
+        return project_runtime if project_runtime.exists() else Path(sys.executable)
 
     def validate_llm_config(self) -> None:
         missing = []

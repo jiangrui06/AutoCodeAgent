@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 import warnings
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,12 @@ from dependency_manager import (
     create_install_context,
 )
 from request_router import RouteDecision
+from openhands_adapter import (
+    OpenHandsRunResult,
+    create_openhands_permission_context,
+    parse_openhands_permission_context,
+    session_id_to_conversation_id,
+)
 
 
 class WebUiStructureTests(unittest.TestCase):
@@ -45,6 +52,17 @@ class WebUiStructureTests(unittest.TestCase):
         self.assertIn("允许本次操作", values)
         self.assertIn("拒绝并停止", values)
 
+    def test_session_and_pending_permission_use_browser_persistent_state(self) -> None:
+        config = app_web.demo.get_config_file()
+        browser_states = {
+            component["props"].get("storage_key")
+            for component in config["components"]
+            if component["type"] == "browserstate"
+        }
+
+        self.assertIn("autocodeagent-session-v1", browser_states)
+        self.assertIn("autocodeagent-pending-permission-v1", browser_states)
+
     def test_permission_buttons_map_pending_context_to_explicit_answers(self) -> None:
         execution_pending = create_execution_permission_context(
             "调用外部工具",
@@ -54,6 +72,18 @@ class WebUiStructureTests(unittest.TestCase):
         install_pending = create_install_context(
             "写一个 PyQt5 界面",
             MissingDependency("PyQt5", "PyQt5"),
+        )
+        openhands_pending = create_openhands_permission_context(
+            session_id_to_conversation_id("session-one"),
+            "运行项目测试",
+            (
+                SimpleNamespace(
+                    tool_name="terminal",
+                    summary="运行测试",
+                    security_risk="LOW",
+                    action=SimpleNamespace(command="python -m unittest"),
+                ),
+            ),
         )
 
         self.assertEqual(
@@ -72,7 +102,77 @@ class WebUiStructureTests(unittest.TestCase):
             app_web._pending_permission_response(install_pending, approved=False),
             "取消安装",
         )
+        self.assertEqual(
+            app_web._pending_permission_response(openhands_pending, approved=True),
+            "允许执行",
+        )
+        self.assertEqual(
+            app_web._pending_permission_response(openhands_pending, approved=False),
+            "拒绝执行",
+        )
         self.assertEqual(app_web._pending_permission_response("", approved=True), "")
+
+    def test_stale_permission_click_preserves_completed_output(self) -> None:
+        completed_output = "## 任务已经完成\n\n不应被过期按钮覆盖。"
+
+        result = list(
+            app_web.approve_pending_permission(
+                "",
+                "session-one",
+                "ask",
+                completed_output,
+            )
+        )
+
+        self.assertEqual(result[-1][0], completed_output)
+        self.assertEqual(result[-1][1], "")
+
+    def test_new_chat_reset_is_immediate_and_not_queued(self) -> None:
+        config = app_web.demo.get_config_file()
+        reset_event = next(
+            dependency
+            for dependency in config["dependencies"]
+            if dependency.get("api_name", "").startswith("reset_conversation")
+        )
+
+        self.assertIs(reset_event.get("queue"), False)
+
+    def test_permission_buttons_call_backend_directly_with_session_state(self) -> None:
+        config = app_web.demo.get_config_file()
+        components = config["components"]
+        dependencies = config["dependencies"]
+        ids_by_elem_id = {
+            component.get("props", {}).get("elem_id"): component["id"]
+            for component in components
+            if component.get("props", {}).get("elem_id")
+        }
+        row_id = ids_by_elem_id["permission-actions"]
+
+        for button_elem_id, backend_name in (
+            ("approve-permission-button", "approve_pending_permission"),
+            ("deny-permission-button", "deny_pending_permission"),
+        ):
+            button_id = ids_by_elem_id[button_elem_id]
+            backend_event = next(
+                dependency
+                for dependency in dependencies
+                if dependency.get("api_name", "").startswith(backend_name)
+            )
+            self.assertTrue(
+                any(
+                    target[0] == button_id and target[1] == "click"
+                    for target in backend_event.get("targets", [])
+                )
+            )
+            self.assertIsNone(backend_event.get("trigger_after"))
+            self.assertEqual(len(backend_event.get("inputs", [])), 6)
+            self.assertTrue(
+                any(
+                    dependency.get("trigger_after") == backend_event["id"]
+                    and dependency.get("outputs") == [row_id]
+                    for dependency in dependencies
+                )
+            )
 
     def test_css_includes_tokens_responsive_and_accessibility_rules(self) -> None:
         css = app_web.CUSTOM_CSS
@@ -144,6 +244,7 @@ class WebUiStructureTests(unittest.TestCase):
 
         self.assertEqual(options["max_file_size"], "10mb")
 
+    @patch("app_web.logger.info")
     @patch("config.Settings.validate_llm_config")
     @patch("app_web.get_memory_store", return_value=None)
     @patch(
@@ -159,6 +260,7 @@ class WebUiStructureTests(unittest.TestCase):
         route,
         _memory,
         _validate,
+        logger_info,
     ) -> None:
         result = list(app_web.run_agent("检查这个文件", attachments=["sample.png"]))
 
@@ -167,9 +269,241 @@ class WebUiStructureTests(unittest.TestCase):
         self.assertIn("检查这个文件", routed_requirement)
         self.assertIn("ATTACHMENT-CONTEXT", routed_requirement)
         self.assertIn("已收到附件", result[-1][0])
+        logged_messages = "\n".join(str(call) for call in logger_info.call_args_list)
+        self.assertNotIn("ATTACHMENT-CONTEXT", logged_messages)
 
 
 class WebAgentFlowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # 用户可在 .env 启用 OpenHands；旧引擎回归测试必须与本机配置解耦。
+        self._engine_patch = patch.object(app_web.settings, "agent_engine", "legacy")
+        self._engine_patch.start()
+
+    def tearDown(self) -> None:
+        self._engine_patch.stop()
+
+    @patch("config.Settings.validate_llm_config")
+    @patch("app_web.get_memory_store", return_value=None)
+    @patch("app_web.route_user_request", return_value=RouteDecision("code"))
+    @patch("app_web.execute_openhands_task")
+    def test_openhands_engine_handles_only_code_requests(
+        self,
+        execute_openhands,
+        _route,
+        _memory,
+        _validate,
+    ) -> None:
+        execute_openhands.return_value = OpenHandsRunResult(
+            status="finished",
+            markdown="## OpenHands 任务完成",
+            code="print('ok')\n",
+            saved_path="C:/workspace/done.py",
+        )
+
+        with patch.object(app_web.settings, "agent_engine", "openhands"):
+            result = list(app_web.run_agent("创建并测试程序", session_id="a" * 32))
+
+        execute_openhands.assert_called_once()
+        self.assertEqual(execute_openhands.call_args.kwargs["decision"], "start")
+        self.assertIn("OpenHands 任务完成", result[-1][0])
+        self.assertEqual(result[-1][4], "print('ok')\n")
+        self.assertEqual(result[-1][5], "C:/workspace/done.py")
+
+    @patch("config.Settings.validate_llm_config")
+    @patch("app_web.get_memory_store", return_value=None)
+    @patch("app_web.execute_openhands_task")
+    def test_openhands_permission_approval_resumes_the_same_conversation(
+        self,
+        execute_openhands,
+        _memory,
+        _validate,
+    ) -> None:
+        conversation_id = session_id_to_conversation_id("a" * 32)
+        pending = create_openhands_permission_context(
+            conversation_id,
+            "运行项目测试",
+            (
+                SimpleNamespace(
+                    tool_name="terminal",
+                    summary="运行测试",
+                    security_risk="LOW",
+                    action=SimpleNamespace(command="python -m unittest"),
+                ),
+            ),
+        )
+        execute_openhands.return_value = OpenHandsRunResult(
+            status="finished",
+            markdown="## 批准后执行完成",
+        )
+
+        result = list(app_web.approve_pending_permission(pending, "a" * 32, "ask"))
+
+        execute_openhands.assert_called_once()
+        call = execute_openhands.call_args
+        self.assertEqual(call.kwargs["decision"], "approve")
+        self.assertEqual(call.kwargs["conversation_id"], conversation_id)
+        parsed = parse_openhands_permission_context(pending)
+        self.assertEqual(
+            call.kwargs["expected_action_summaries"],
+            parsed.action_summaries,
+        )
+        self.assertIn("批准后执行完成", result[-1][0])
+        self.assertEqual(result[-1][1], "")
+
+    @patch("config.Settings.validate_llm_config")
+    @patch("app_web.get_memory_store", return_value=None)
+    @patch("app_web.build_attachment_context", return_value="DOCUMENT-CONTEXT")
+    @patch("app_web.prepare_attachments", return_value=(MagicMock(kind="文本"),))
+    @patch(
+        "app_web.route_user_request",
+        return_value=RouteDecision("chat", "文档读取成功"),
+    )
+    @patch("app_web.execute_openhands_task")
+    def test_new_attachment_rejects_stale_openhands_action_and_is_processed(
+        self,
+        execute_openhands,
+        route,
+        prepare,
+        _build_context,
+        _memory,
+        _validate,
+    ) -> None:
+        conversation_id = session_id_to_conversation_id("attachment-session")
+        pending = create_openhands_permission_context(
+            conversation_id,
+            "old image task",
+            (
+                SimpleNamespace(
+                    tool_name="terminal",
+                    summary="old pending action",
+                    security_risk="UNKNOWN",
+                    action=SimpleNamespace(command="python old_task.py"),
+                ),
+            ),
+        )
+        execute_openhands.return_value = OpenHandsRunResult(
+            status="rejected",
+            markdown="old action rejected",
+        )
+
+        with patch.object(app_web.settings, "agent_engine", "openhands"):
+            result = list(
+                app_web.run_agent(
+                    "读取这个新文档",
+                    pending_context=pending,
+                    session_id="attachment-session",
+                    permission_level="ask",
+                    attachments=["report.docx"],
+                )
+            )
+
+        self.assertEqual(execute_openhands.call_count, 1)
+        self.assertEqual(execute_openhands.call_args.kwargs["decision"], "reject")
+        self.assertEqual(
+            execute_openhands.call_args.kwargs["conversation_id"], conversation_id
+        )
+        prepare.assert_called_once()
+        self.assertIn("DOCUMENT-CONTEXT", route.call_args.args[0])
+        self.assertIn("文档读取成功", result[-1][0])
+        self.assertEqual(result[-1][1], "")
+
+    @patch("config.Settings.validate_llm_config")
+    @patch("app_web.get_memory_store", return_value=None)
+    @patch("app_web.build_attachment_context", return_value="IMAGE-CONTEXT")
+    @patch("app_web.prepare_attachments")
+    @patch(
+        "app_web.route_user_request",
+        return_value=RouteDecision("chat", "text-only fallback"),
+    )
+    @patch("app_web.execute_openhands_task")
+    def test_openhands_image_request_forwards_the_image_even_if_router_says_chat(
+        self,
+        execute_openhands,
+        _route,
+        prepare,
+        _build_context,
+        _memory,
+        _validate,
+    ) -> None:
+        image_path = Path("C:/project/user_uploads/session/image.png")
+        prepare.return_value = (
+            SimpleNamespace(
+                kind="图片",
+                original_name="image.png",
+                stored_path=image_path,
+            ),
+        )
+        execute_openhands.return_value = OpenHandsRunResult(
+            status="finished",
+            markdown="image described",
+        )
+
+        with patch.object(app_web.settings, "agent_engine", "openhands"):
+            result = list(
+                app_web.run_agent(
+                    "这张图片是什么",
+                    session_id="image-session",
+                    permission_level="ask",
+                    attachments=["image.png"],
+                )
+            )
+
+        execute_openhands.assert_called_once()
+        self.assertEqual(execute_openhands.call_args.kwargs["decision"], "start")
+        self.assertEqual(
+            execute_openhands.call_args.kwargs["image_paths"], [str(image_path)]
+        )
+        self.assertFalse(execute_openhands.call_args.kwargs["allow_tools"])
+        self.assertIn("image described", result[-1][0])
+
+    @patch("config.Settings.validate_llm_config")
+    @patch("app_web.get_memory_store", return_value=None)
+    @patch("app_web.build_attachment_context", return_value="DOCUMENT-CONTEXT")
+    @patch("app_web.prepare_attachments")
+    @patch(
+        "app_web.route_user_request",
+        return_value=RouteDecision("clarify", "你希望如何处理这个文档？"),
+    )
+    @patch("app_web.execute_openhands_task")
+    def test_read_only_document_bypasses_clarification_without_tools(
+        self,
+        execute_openhands,
+        _route,
+        prepare,
+        _build_context,
+        _memory,
+        _validate,
+    ) -> None:
+        document_path = Path("C:/project/user_uploads/session/report.docx")
+        prepare.return_value = (
+            SimpleNamespace(
+                kind="Word 文档",
+                original_name="report.docx",
+                stored_path=document_path,
+            ),
+        )
+        execute_openhands.return_value = OpenHandsRunResult(
+            status="finished",
+            markdown="文档内容概括完成",
+        )
+
+        with patch.object(app_web.settings, "agent_engine", "openhands"):
+            result = list(
+                app_web.run_agent(
+                    "读取并概括这个文档，不要修改文件",
+                    session_id="document-session",
+                    permission_level="ask",
+                    attachments=["report.docx"],
+                )
+            )
+
+        execute_openhands.assert_called_once()
+        self.assertEqual(execute_openhands.call_args.kwargs["decision"], "start")
+        self.assertEqual(execute_openhands.call_args.kwargs["image_paths"], [])
+        self.assertFalse(execute_openhands.call_args.kwargs["allow_tools"])
+        self.assertIn("文档内容概括完成", result[-1][0])
+        self.assertEqual(result[-1][1], "")
+
     def test_trusted_mode_reuses_only_an_equal_or_smaller_approved_scope(self) -> None:
         state = MagicMock(
             approved_code_hash="approved-once",

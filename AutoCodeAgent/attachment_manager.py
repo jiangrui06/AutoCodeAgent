@@ -19,6 +19,11 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_TOTAL_SIZE = 25 * 1024 * 1024
 MAX_TEXT_PREVIEW_CHARS = 8_000
 MAX_CONTEXT_TEXT_CHARS = 20_000
+MAX_PDF_PAGES = 50
+MAX_DOCX_BLOCKS = 500
+MAX_XLSX_SHEETS = 5
+MAX_XLSX_ROWS = 200
+MAX_XLSX_COLUMNS = 30
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 TEXT_EXTENSIONS = {
@@ -105,6 +110,104 @@ def _read_text_preview(path: Path) -> str:
     return text[:MAX_TEXT_PREVIEW_CHARS]
 
 
+def _bounded_text(parts: Iterable[object]) -> str:
+    output: list[str] = []
+    remaining = MAX_TEXT_PREVIEW_CHARS
+    for value in parts:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        chunk = text[:remaining]
+        output.append(chunk)
+        remaining -= len(chunk) + 1
+        if remaining <= 0:
+            break
+    return "\n".join(output)[:MAX_TEXT_PREVIEW_CHARS]
+
+
+def _read_pdf_preview(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(path, strict=False)
+        if reader.is_encrypted:
+            raise AttachmentValidationError(f"`{path.name}` 已加密，暂时无法读取文本。")
+        text = _bounded_text(
+            page.extract_text() for page in reader.pages[:MAX_PDF_PAGES]
+        )
+    except AttachmentValidationError:
+        raise
+    except Exception as exc:
+        raise AttachmentValidationError(
+            f"`{path.name}` 的 PDF 文本解析失败（{type(exc).__name__}）。"
+        ) from exc
+    return text or "（未提取到可读取文本；文件可能是扫描版或仅包含图片。）"
+
+
+def _read_docx_preview(path: Path) -> str:
+    try:
+        from docx import Document
+
+        document = Document(path)
+        parts: list[str] = []
+        for index, block in enumerate(document.iter_inner_content()):
+            if index >= MAX_DOCX_BLOCKS:
+                break
+            rows = getattr(block, "rows", None)
+            if rows is None:
+                parts.append(getattr(block, "text", ""))
+                continue
+            for row in rows:
+                parts.append("\t".join(cell.text for cell in row.cells))
+        text = _bounded_text(parts)
+    except Exception as exc:
+        raise AttachmentValidationError(
+            f"`{path.name}` 的 Word 文本解析失败（{type(exc).__name__}）。"
+        ) from exc
+    return text or "（Word 文档中没有可读取文本。）"
+
+
+def _read_xlsx_preview(path: Path) -> str:
+    workbook = None
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(
+            filename=path,
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+        )
+        parts: list[str] = []
+        remaining_rows = MAX_XLSX_ROWS
+        for sheet in workbook.worksheets[:MAX_XLSX_SHEETS]:
+            parts.append(f"[工作表: {sheet.title}]")
+            for row in sheet.iter_rows(
+                max_row=remaining_rows,
+                max_col=MAX_XLSX_COLUMNS,
+                values_only=True,
+            ):
+                values = ["" if value is None else str(value) for value in row]
+                while values and not values[-1]:
+                    values.pop()
+                if values:
+                    parts.append("\t".join(values))
+                remaining_rows -= 1
+                if remaining_rows <= 0:
+                    break
+            if remaining_rows <= 0:
+                break
+        text = _bounded_text(parts)
+    except Exception as exc:
+        raise AttachmentValidationError(
+            f"`{path.name}` 的 Excel 文本解析失败（{type(exc).__name__}）。"
+        ) from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
+    return text or "（Excel 工作簿中没有可读取单元格。）"
+
+
 def _validate_and_describe(path: Path, extension: str) -> tuple[str, str]:
     if extension in IMAGE_EXTENSIONS:
         _validate_image_signature(path, extension)
@@ -114,10 +217,13 @@ def _validate_and_describe(path: Path, extension: str) -> tuple[str, str]:
     if extension == ".pdf":
         if not path.read_bytes()[:5].startswith(b"%PDF-"):
             raise AttachmentValidationError(f"`{path.name}` 不是有效的 PDF 文件。")
-        return "PDF 文档", ""
-    if extension in {".docx", ".xlsx"}:
+        return "PDF 文档", _read_pdf_preview(path)
+    if extension == ".docx":
         _validate_office_archive(path, extension)
-        return "Office 文档", ""
+        return "Word 文档", _read_docx_preview(path)
+    if extension == ".xlsx":
+        _validate_office_archive(path, extension)
+        return "Excel 工作簿", _read_xlsx_preview(path)
     raise AttachmentValidationError(f"不支持 `{extension or '无扩展名'}` 类型的附件。")
 
 

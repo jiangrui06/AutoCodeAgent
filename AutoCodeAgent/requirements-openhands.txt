@@ -1,0 +1,3 @@
+# 仅用于独立 OpenHands 运行时，禁止安装进 Gradio Web 的 .venv。Python 3.12+。
+openhands-sdk==1.36.1
+openhands-tools==1.36.1

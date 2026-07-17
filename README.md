@@ -34,7 +34,7 @@
 
 ## 项目简介
 
-**AutoCodeAgent** 是一个基于 **LangGraph** 状态机驱动的自动编码调试智能体。只需输入一句**自然语言开发需求**，Agent 就会自动完成以下闭环：
+**AutoCodeAgent** 支持两套可切换引擎：稳定保留原有 **LangGraph** 状态机，并可渐进启用 **OpenHands Agent SDK** 的持久工具循环。只需输入一句**自然语言开发需求**，Agent 就会自动完成编码闭环；普通问候仍只会聊天。
 
 ```
 需求分析(Planner) → 代码生成(Coder) → 静态检查(Linter) → 安全扫描(Scanner)
@@ -62,6 +62,7 @@
 | 📊 **可观测性** | 内置 Loguru 日志 + 可选 LangSmith 追踪，每一步都有迹可循 |
 | 💾 **版本快照** | 每次重试的代码自动保存，完整可追溯 |
 | 🧠 **长期记忆** | SQLite 保存结构化记忆，Obsidian Markdown 同步对话、代码、输出和日志 |
+| 🧰 **OpenHands 引擎** | 独立虚拟环境运行，支持工具调用暂停/批准/拒绝、会话恢复和自主测试修复 |
 
 ---
 
@@ -130,6 +131,8 @@
 | **日志** | [`logger.py`](AutoCodeAgent/logger.py) | Loguru 结构化日志，控制台 + 文件双输出 |
 | **命令行入口** | [`main.py`](AutoCodeAgent/main.py) | CLI 交互，接收需求并运行完整流程 |
 | **Web 界面** | [`app_web.py`](AutoCodeAgent/app_web.py) | Gradio 可视化界面，步骤级流式输出 |
+| **OpenHands 适配层** | [`openhands_adapter.py`](AutoCodeAgent/openhands_adapter.py) | 隔离运行时通信、权限上下文、会话恢复与结果格式化 |
+| **OpenHands Worker** | [`openhands_worker.py`](AutoCodeAgent/openhands_worker.py) | 在独立 SDK 虚拟环境中运行工具循环，避免与 Gradio 依赖冲突 |
 
 ---
 
@@ -176,6 +179,7 @@ LLM_DISABLE_REASONING=false
 SANDBOX_TIMEOUT=15
 
 # Agent / Web（可选）
+AGENT_ENGINE=legacy
 AGENT_MAX_RETRY=5
 WEB_SERVER_NAME=127.0.0.1
 WEB_SERVER_PORT=7870
@@ -187,6 +191,28 @@ MEMORY_DIR=C:\Users\your-name\Documents\AutoCodeAgent-Memory
 MEMORY_RECALL_LIMIT=12
 ERROR_MEMORY_RECALL_LIMIT=3
 ```
+
+### 可选：启用 OpenHands 自主编程引擎
+
+OpenHands 与当前 Gradio 对 Pydantic、Starlette、Pillow 的版本要求不同，建议使用独立虚拟环境，不要直接安装进 Web 的 `.venv`。如果已经将 SDK 拉取到桌面 `software-agent-sdk`，程序会自动发现它：
+
+```powershell
+cd C:\Users\your-name\Desktop\software-agent-sdk
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install uv
+.venv\Scripts\uv.exe sync --frozen --no-dev --inexact --package openhands-sdk --package openhands-tools
+```
+
+然后在 AutoCodeAgent 的 `.env` 中启用：
+
+```ini
+AGENT_ENGINE=openhands
+OPENHANDS_MAX_ITERATIONS=20
+# 自动发现失败时再显式设置：
+# OPENHANDS_PYTHON=C:\Users\your-name\Desktop\software-agent-sdk\.venv\Scripts\python.exe
+```
+
+`询问模式`会在每批工具调用前暂停并显示工具名、风险和参数；批准后恢复同一会话，拒绝后不会执行该操作。`信任模式`会自主执行低风险操作，高风险或无法判断的操作仍会询问。OpenHands 默认工作目录为 `AutoCodeAgent/auto_generated_code`；工作区外写入、依赖安装、删除/移动和危险命令会提升为高风险并要求确认。这是应用层权限边界，不是操作系统级硬沙箱。原始事件保存在长期记忆目录的 `OpenHands会话` 中。
 
 > **支持其他 LLM 服务？** 只需修改 `LLM_BASE_URL` 和 `LLM_MODEL` 即可兼容任何 OpenAI 兼容接口。旧版 `SILICONFLOW_*` 变量仍然兼容。
 

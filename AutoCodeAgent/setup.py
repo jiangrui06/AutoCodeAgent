@@ -21,6 +21,7 @@ setup(
     author="AutoCodeAgent Team",
     py_modules=[
         "app_web",
+        "attachment_manager",
         "code_linter",
         "code_sandbox",
         "code_scanner",
@@ -33,6 +34,9 @@ setup(
         "logger",
         "main",
         "memory_store",
+        "openhands_adapter",
+        "openhands_worker",
+        "openhands_workspace_security",
         "request_router",
         "state_model",
     ],
