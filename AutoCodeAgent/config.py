@@ -1,46 +1,104 @@
-"""全局配置管理 — 使用 Pydantic Settings 统一读取 .env"""
+"""应用配置中心。
 
-import os
+配置优先级：系统环境变量 > 项目目录下的 .env > 代码默认值。
+通用的 LLM_* 变量优先，同时兼容旧版 SILICONFLOW_* 变量。
+"""
+
+from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 先把 .env 加载到 os.environ，方便 LangChain/LangSmith 等第三方库自动读取
-load_dotenv(override=True)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ENV_FILE = PROJECT_DIR / ".env"
+
+# LangChain/LangSmith 直接读取 os.environ。override=False 确保外部注入的变量优先。
+load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 
 class Settings(BaseSettings):
-    """应用配置，所有值均可通过 .env 覆盖"""
+    """应用配置；未配置 API 时也允许导入模块，调用 LLM 前再明确报错。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
-        extra="ignore",  # 允许 .env 里存在未声明的变量（如 LANGCHAIN_*）
+        extra="ignore",
+        populate_by_name=True,
     )
 
-    # LLM 配置
-    siliconflow_api_key: str = Field(alias="SILICONFLOW_API_KEY")
-    siliconflow_base_url: str = Field(alias="SILICONFLOW_BASE_URL")
-    siliconflow_model: str = Field(alias="SILICONFLOW_MODEL")
-
+    # OpenAI 兼容接口配置
+    llm_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("LLM_API_KEY", "SILICONFLOW_API_KEY"),
+    )
+    llm_base_url: str = Field(
+        default="https://api.siliconflow.cn/v1",
+        validation_alias=AliasChoices("LLM_BASE_URL", "SILICONFLOW_BASE_URL"),
+    )
+    llm_model: str = Field(
+        default="deepseek-ai/DeepSeek-V4-Pro",
+        validation_alias=AliasChoices("LLM_MODEL", "SILICONFLOW_MODEL"),
+    )
     llm_temperature: float = Field(default=0.1, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=8192, alias="LLM_MAX_TOKENS")
     llm_timeout: int = Field(default=300, alias="LLM_TIMEOUT")
+    llm_disable_reasoning: bool = Field(default=False, alias="LLM_DISABLE_REASONING")
 
-    # LangSmith 可观测性（可选，自动被 LangGraph/LangChain 读取）
+    # Agent / 执行配置
+    agent_max_retry: int = Field(default=5, ge=1, le=20, alias="AGENT_MAX_RETRY")
+    sandbox_timeout: int = Field(default=15, ge=1, le=600, alias="SANDBOX_TIMEOUT")
+
+    # Web 配置
+    web_server_name: str = Field(default="127.0.0.1", alias="WEB_SERVER_NAME")
+    web_server_port: int = Field(default=7870, ge=1, le=65535, alias="WEB_SERVER_PORT")
+    web_inbrowser: bool = Field(default=True, alias="WEB_INBROWSER")
+    web_max_upload_mb: int = Field(default=10, ge=1, le=100, alias="WEB_MAX_UPLOAD_MB")
+
+    # 长期记忆 / Obsidian
+    memory_enabled: bool = Field(default=True, alias="MEMORY_ENABLED")
+    memory_dir: Path = Field(
+        default=Path.home() / "Documents" / "AutoCodeAgent-Memory",
+        alias="MEMORY_DIR",
+    )
+    memory_recall_limit: int = Field(default=12, ge=1, le=50, alias="MEMORY_RECALL_LIMIT")
+    error_memory_recall_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        alias="ERROR_MEMORY_RECALL_LIMIT",
+    )
+
+    # LangSmith 可观测性
     langchain_tracing_v2: bool = Field(default=False, alias="LANGCHAIN_TRACING_V2")
     langchain_api_key: str = Field(default="", alias="LANGCHAIN_API_KEY")
     langchain_project: str = Field(default="autocode-agent", alias="LANGCHAIN_PROJECT")
 
-    # 沙箱
-    sandbox_timeout: int = Field(default=15, alias="SANDBOX_TIMEOUT")
-
     @property
     def base_url(self) -> str:
-        """去除末尾斜杠的 base_url"""
-        return self.siliconflow_base_url.rstrip("/")
+        return self.llm_base_url.rstrip("/")
+
+    @property
+    def is_llm_configured(self) -> bool:
+        placeholders = ("your_", "sk-xxx", "here")
+        key = self.llm_api_key.strip().lower()
+        return bool(key) and not any(value in key for value in placeholders)
+
+    def validate_llm_config(self) -> None:
+        missing = []
+        if not self.is_llm_configured:
+            missing.append("LLM_API_KEY")
+        if not self.base_url:
+            missing.append("LLM_BASE_URL")
+        if not self.llm_model.strip():
+            missing.append("LLM_MODEL")
+        if missing:
+            names = ", ".join(missing)
+            raise RuntimeError(
+                f"LLM 配置不完整：{names}。请复制 .env.example 为 .env，"
+                "填入 OpenAI 兼容服务的真实配置后重试。"
+            )
 
 
-# 全局单例
 settings = Settings()

@@ -16,23 +16,31 @@ import sys
 import tempfile
 import subprocess
 import traceback
+from dataclasses import dataclass
+from typing import Iterator
 
 from config import settings
 
 
-def _get_console_encoding() -> str:
-    """获取子进程控制台输出编码
+@dataclass(frozen=True)
+class ExecutionResult:
+    """子进程原始结果；迭代时保持兼容旧的 ``stdout, stderr`` 解包。"""
 
-    Windows 控制台通常使用 ANSI 代码页（中文系统为 GBK），
-    而 locale.getpreferredencoding() 可能返回 UTF-8，导致解码乱码。
-    因此 Windows 下优先使用 mbcs（即系统 ANSI 代码页）。
-    """
-    if sys.platform == "win32":
-        return "mbcs"
+    stdout: str
+    stderr: str
+    returncode: int
+
+    def __iter__(self) -> Iterator[str]:
+        yield self.stdout
+        yield self.stderr
+
+
+def _get_console_encoding() -> str:
+    """返回隔离子进程显式启用的 UTF-8 输出编码。"""
     return "utf-8"
 
 
-def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
+def safe_execute_code(code_str: str, timeout: int = None) -> ExecutionResult:
     """在子进程中执行 Python 代码并捕获输出
 
     Args:
@@ -40,7 +48,7 @@ def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
         timeout: 超时秒数，默认从 .env 的 SANDBOX_TIMEOUT 读取（默认 15s）
 
     Returns:
-        (stdout, stderr)
+        ExecutionResult；仍可使用 ``stdout, stderr = result`` 解包
     """
     if timeout is None:
         timeout = settings.sandbox_timeout
@@ -49,7 +57,11 @@ def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
     try:
         compile(code_str, "<pre-check>", "exec")
     except SyntaxError as e:
-        return "", f"[SyntaxError] 语法错误：{e}\n{traceback.format_exc()}"
+        return ExecutionResult(
+            "",
+            f"[SyntaxError] 语法错误：{e}\n{traceback.format_exc()}",
+            -1,
+        )
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
@@ -70,8 +82,15 @@ def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
 
         # 子进程执行
         # -I 隔离模式：忽略 PYTHON* 环境变量，不加载用户 site-packages
+        # -I 会忽略 PYTHONIOENCODING 等 PYTHON* 环境变量，因此使用 -X utf8
+        # 显式统一 Windows/Linux 的标准流编码，避免 ✓、emoji 等字符在 GBK
+        # 控制台上触发 UnicodeEncodeError。
+        command = [sys.executable, "-I", "-X", "utf8", tmp.name]
+        if "--autocode-self-test" in code_str:
+            command.append("--autocode-self-test")
+
         proc = subprocess.run(
-            [sys.executable, "-I", tmp.name],
+            command,
             capture_output=True,
             text=True,
             encoding=_get_console_encoding(),
@@ -83,17 +102,21 @@ def safe_execute_code(code_str: str, timeout: int = None) -> tuple[str, str]:
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
 
-        # 非零退出码但没有 stderr → 补充提示
-        if proc.returncode != 0 and not stderr.strip():
-            stderr = f"[ExitCode {proc.returncode}] 进程异常退出，可能被信号中断或代码崩溃无输出。"
-
-        return stdout, stderr
+        return ExecutionResult(stdout, stderr, proc.returncode)
 
     except subprocess.TimeoutExpired:
-        return "", f"[SandboxError] 执行超时 {timeout} 秒，已强制终止（请检查代码中是否存在死循环）。"
+        return ExecutionResult(
+            "",
+            f"[SandboxError] 执行超时 {timeout} 秒，已强制终止（请检查代码中是否存在死循环）。",
+            -1,
+        )
 
     except Exception as e:
-        return "", f"[SandboxError] 子进程执行异常：{type(e).__name__}: {e}"
+        return ExecutionResult(
+            "",
+            f"[SandboxError] 子进程执行异常：{type(e).__name__}: {e}",
+            -1,
+        )
 
     finally:
         # 清理临时文件

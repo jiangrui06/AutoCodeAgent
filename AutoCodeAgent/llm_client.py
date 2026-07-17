@@ -1,39 +1,48 @@
-"""LLM 客户端封装 — 兼容 OpenAI 标准接口，统一复用
+"""OpenAI 兼容 LLM 客户端。"""
 
-配置统一从 config.settings 读取，支持 SiliconFlow / OpenAI / 任何兼容 OpenAI 接口的服务。
-"""
-
-from typing import Optional
+from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
 
 from config import settings
 
 
-_llm_instance: Optional[ChatOpenAI] = None
+def _extra_body(disable_reasoning: bool) -> dict | None:
+    """为支持 thinking 开关的 OpenAI 兼容服务关闭推理输出。"""
+    if disable_reasoning:
+        return {"thinking": {"type": "disabled"}}
+    return None
 
 
+@lru_cache(maxsize=1)
 def get_deepseek_llm() -> ChatOpenAI:
-    """获取 LLM 实例（缓存，单例复用）"""
-    global _llm_instance
-    _llm_instance = ChatOpenAI(
+    """延迟创建并缓存默认 LLM 客户端。"""
+    settings.validate_llm_config()
+    return ChatOpenAI(
         base_url=settings.base_url,
-        api_key=settings.siliconflow_api_key,
-        model=settings.siliconflow_model,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout,
+        extra_body=_extra_body(settings.llm_disable_reasoning),
     )
-    return _llm_instance
 
 
 def get_llm_with_config(**overrides) -> ChatOpenAI:
-    """使用覆盖参数创建临时 LLM 实例（不缓存）"""
+    """使用覆盖参数创建临时 LLM 客户端（不缓存）。"""
+    api_key = overrides.get("api_key", settings.llm_api_key)
+    if not api_key:
+        settings.validate_llm_config()
     return ChatOpenAI(
         base_url=overrides.get("base_url", settings.base_url),
-        api_key=overrides.get("api_key", settings.siliconflow_api_key),
-        model=overrides.get("model", settings.siliconflow_model),
+        api_key=api_key,
+        model=overrides.get("model", settings.llm_model),
         temperature=overrides.get("temperature", settings.llm_temperature),
         max_tokens=overrides.get("max_tokens", settings.llm_max_tokens),
         timeout=overrides.get("timeout", settings.llm_timeout),
+        extra_body=overrides.get(
+            "extra_body",
+            _extra_body(overrides.get("disable_reasoning", settings.llm_disable_reasoning)),
+        ),
     )

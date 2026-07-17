@@ -2,7 +2,15 @@
 
 from langgraph.graph import END, StateGraph
 
-from graph_nodes import coder_node, executor_node, fixer_node, judge_route, planner_node
+from graph_nodes import (
+    coder_node,
+    diagnose_failure_node,
+    executor_node,
+    fixer_node,
+    fixer_route,
+    judge_route,
+    planner_node,
+)
 from state_model import CodeAgentState
 
 
@@ -20,6 +28,7 @@ def build_code_agent_graph() -> StateGraph:
     graph.add_node("planner", planner_node)
     graph.add_node("coder", coder_node)
     graph.add_node("executor", executor_node)
+    graph.add_node("diagnoser", diagnose_failure_node)
     graph.add_node("fixer", fixer_node)
 
     # ── 固定流转边 ──
@@ -31,13 +40,22 @@ def build_code_agent_graph() -> StateGraph:
         "executor",
         judge_route,
         {
-            "fixer": "fixer",
+            "fixer": "diagnoser",
             "end_task": END,
         },
     )
 
-    # ── 修复 → 重新执行 ──
-    graph.add_edge("fixer", "executor")
+    # ── 修复 → 重新执行；代码完全没变化时熔断 ──
+    graph.add_conditional_edges(
+        "fixer",
+        fixer_route,
+        {
+            "executor": "executor",
+            "end_task": END,
+        },
+    )
+
+    graph.add_edge("diagnoser", "fixer")
 
     # ── 入口 ──
     graph.set_entry_point("planner")

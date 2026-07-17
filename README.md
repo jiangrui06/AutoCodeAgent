@@ -20,6 +20,8 @@
 - [项目架构](#项目架构)
 - [快速开始](#快速开始)
 - [使用示例](#使用示例)
+- [Web 界面操作](#web-界面操作)
+- [依赖自动安装](#依赖自动安装)
 - [安全机制](#安全机制)
 - [可观测性](#可观测性)
 - [配置文件](#配置文件)
@@ -42,7 +44,7 @@
                                   无错 → 结束     有错 → 自动修复(Fixer) → 重新执行
 ```
 
-全流程无需人工干预，最多自动修复 **5 轮**，每轮代码自动快照存档。
+全流程无需人工干预，最多自动修复 **5 轮**，每轮代码自动快照存档。遇到缺失依赖时，Agent 会暂停并请求你确认安装，安装成功后自动回到原需求继续执行。
 
 ---
 
@@ -55,9 +57,11 @@
 | 🔒 **安全沙箱** | 独立子进程隔离执行，超时强杀，Windows 下低优先级运行不卡机 |
 | 🛡️ **代码扫描** | AST + 正则双引擎静态分析，拦截危险代码（文件删除、网络外泄、挖矿等） |
 | 🔄 **自动修复** | 分析报错堆栈 → 修复 → 重新执行，最多 5 轮 |
+| 📦 **依赖自动安装** | 检测到缺失依赖时暂停，经你确认后自动安装并继续 |
 | 🖥️ **双模式交互** | 命令行 CLI + Gradio Web 可视化界面 |
 | 📊 **可观测性** | 内置 Loguru 日志 + 可选 LangSmith 追踪，每一步都有迹可循 |
 | 💾 **版本快照** | 每次重试的代码自动保存，完整可追溯 |
+| 🧠 **长期记忆** | SQLite 保存结构化记忆，Obsidian Markdown 同步对话、代码、输出和日志 |
 
 ---
 
@@ -105,11 +109,15 @@
                                      └─────────────┘
 ```
 
+执行完成后，如果检测到 `ModuleNotFoundError` 等依赖缺失错误，系统会进入**依赖确认/安装**流程，安装成功后从原需求继续执行。
+
 ### 模块说明
 
 | 模块 | 文件 | 职责 |
 | --- | --- | --- |
 | **配置中心** | [`config.py`](AutoCodeAgent/config.py) | Pydantic Settings 统一管理 `.env`，支持 LangSmith 等第三方库自动读取 |
+| **意图路由** | [`request_router.py`](AutoCodeAgent/request_router.py) | 区分聊天、编码和需要澄清的需求，并提炼长期事实 |
+| **长期记忆** | [`memory_store.py`](AutoCodeAgent/memory_store.py) | SQLite 持久化与 Obsidian Markdown 会话日志 |
 | **LLM 客户端** | [`llm_client.py`](AutoCodeAgent/llm_client.py) | 封装 ChatOpenAI，支持 SiliconFlow / 商汤 / OpenAI 等兼容接口 |
 | **状态模型** | [`state_model.py`](AutoCodeAgent/state_model.py) | Pydantic v2 全局状态定义，贯穿全流程 |
 | **图节点** | [`graph_nodes.py`](AutoCodeAgent/graph_nodes.py) | Planner → Coder → Executor → Judge → Fixer 节点逻辑 |
@@ -117,6 +125,7 @@
 | **静态检查** | [`code_linter.py`](AutoCodeAgent/code_linter.py) | pyflakes 语义检查 + 编译语法检查 |
 | **代码沙箱** | [`code_sandbox.py`](AutoCodeAgent/code_sandbox.py) | 子进程隔离执行，超时强杀，Windows 低优先级 |
 | **安全扫描** | [`code_scanner.py`](AutoCodeAgent/code_scanner.py) | AST + 正则双引擎扫描，检测危险操作 |
+| **依赖管理** | [`dependency_manager.py`](AutoCodeAgent/dependency_manager.py) | 缺失依赖检测、白名单校验与安装确认 |
 | **文件工具** | [`file_util.py`](AutoCodeAgent/file_util.py) | 生成代码自动持久化，按时间戳/迭代轮次保存 |
 | **日志** | [`logger.py`](AutoCodeAgent/logger.py) | Loguru 结构化日志，控制台 + 文件双输出 |
 | **命令行入口** | [`main.py`](AutoCodeAgent/main.py) | CLI 交互，接收需求并运行完整流程 |
@@ -149,24 +158,37 @@ cp .env.example .env
 
 ```ini
 # SiliconFlow（硅基流动）配置
-SILICONFLOW_API_KEY=sk-your-api-key-here
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
-SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Pro
+LLM_API_KEY=sk-your-api-key-here
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_MODEL=deepseek-ai/DeepSeek-V4-Pro
 
 # 商汤 SenseNova 配置示例
-# SILICONFLOW_BASE_URL=https://token.sensenova.cn/v1
-# SILICONFLOW_MODEL=deepseek-v4-flash
+# LLM_BASE_URL=https://token.sensenova.cn/v1
+# LLM_MODEL=deepseek-v4-flash
 
 # LLM 超参（可选，有默认值）
 LLM_TEMPERATURE=0.1
 LLM_MAX_TOKENS=8192
 LLM_TIMEOUT=300
+LLM_DISABLE_REASONING=false
 
 # 沙箱超时（秒，可选，默认 15）
 SANDBOX_TIMEOUT=15
+
+# Agent / Web（可选）
+AGENT_MAX_RETRY=5
+WEB_SERVER_NAME=127.0.0.1
+WEB_SERVER_PORT=7870
+WEB_INBROWSER=true
+
+# ── 长期记忆 / Obsidian（可选） ──
+MEMORY_ENABLED=true
+MEMORY_DIR=C:\Users\your-name\Documents\AutoCodeAgent-Memory
+MEMORY_RECALL_LIMIT=12
+ERROR_MEMORY_RECALL_LIMIT=3
 ```
 
-> **支持其他 LLM 服务？** 只需修改 `SILICONFLOW_BASE_URL` 和 `SILICONFLOW_MODEL` 即可兼容任何 OpenAI 兼容接口。
+> **支持其他 LLM 服务？** 只需修改 `LLM_BASE_URL` 和 `LLM_MODEL` 即可兼容任何 OpenAI 兼容接口。旧版 `SILICONFLOW_*` 变量仍然兼容。
 
 ### 3. 运行
 
@@ -220,6 +242,36 @@ python app_web.py
 > 写一个批量文件重命名工具，支持递归处理子目录，支持正则替换和序号编号两种模式
 
 全流程同上，自动生成带 `argparse` 命令行参数的文件操作工具。
+
+---
+
+## Web 界面操作
+
+Web 界面基于 Gradio，除了实时查看 Agent 每一步的输出，还提供以下快捷操作：
+
+| 操作 | 说明 |
+| --- | --- |
+| **回车发送** | 在输入框按 `Enter` 即可提交需求，无需点击按钮 |
+| **自动清空** | 发送后输入框自动清空，准备下一条输入 |
+| **复制最终代码** | 任务完成后，点击按钮将最终代码复制到剪贴板（Windows 使用原生 Unicode API，中文不乱码） |
+| **运行生成的代码** | 点击按钮重新执行已保存的 `.py` 文件，运行结果显示在“操作反馈”框中 |
+| **新对话** | 清空当前会话状态，开始新的需求 |
+| **生成文件列表** | 在侧边栏查看所有历史生成文件 |
+
+> **提示**：复制和运行结果都会显示在“操作反馈”框中，不会和主输出区域混在一起。
+
+---
+
+## 依赖自动安装
+
+当生成的代码运行时报出 `ModuleNotFoundError`，Agent 会暂停并进入依赖确认流程：
+
+1. **CLI 模式**：终端提示“是否允许安装到当前虚拟环境？”，输入“允许安装”后自动安装。
+2. **Web 模式**：界面显示“等待安装确认”，回复“允许安装”后自动安装并继续。
+
+安装成功后，Agent 会从原始需求重新开始执行，**不会替换你指定的框架或实现方式**。
+
+> 只有白名单内的受信任包才会被允许自动安装，不在白名单中的依赖会暂停任务并提示你手动处理。
 
 ---
 
@@ -291,17 +343,30 @@ LANGCHAIN_PROJECT=autocode-agent
 
 ```ini
 # ── LLM 服务商配置（必需） ──
-SILICONFLOW_API_KEY=sk-xxx
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
-SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Pro
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_MODEL=deepseek-ai/DeepSeek-V4-Pro
 
 # ── LLM 超参（可选） ──
 LLM_TEMPERATURE=0.1
 LLM_MAX_TOKENS=8192
 LLM_TIMEOUT=300
+LLM_DISABLE_REASONING=false
 
 # ── 沙箱（可选） ──
 SANDBOX_TIMEOUT=15
+
+# ── Agent / Web（可选） ──
+AGENT_MAX_RETRY=5
+WEB_SERVER_NAME=127.0.0.1
+WEB_SERVER_PORT=7870
+WEB_INBROWSER=true
+
+# ── 长期记忆（可选） ──
+MEMORY_ENABLED=true
+MEMORY_DIR=C:\Users\your-name\Documents\AutoCodeAgent-Memory
+MEMORY_RECALL_LIMIT=12
+ERROR_MEMORY_RECALL_LIMIT=3
 
 # ── LangSmith 可观测性（可选） ──
 LANGCHAIN_TRACING_V2=false
@@ -319,12 +384,15 @@ AutoCodeAgent/
 ├── app_web.py               # Gradio Web 可视化界面
 ├── config.py                # Pydantic Settings 配置中心
 ├── llm_client.py            # LLM 客户端封装
+├── request_router.py        # 聊天 / 编码 / 澄清意图路由
+├── memory_store.py          # SQLite + Obsidian 长期记忆
 ├── state_model.py           # LangGraph 全局状态模型
 ├── graph_nodes.py           # 流程节点逻辑
 ├── graph_builder.py         # LangGraph 图调度组装
 ├── code_linter.py           # 静态代码检查
 ├── code_sandbox.py          # 安全子进程执行沙箱
 ├── code_scanner.py          # 代码安全扫描器
+├── dependency_manager.py    # 缺失依赖检测与白名单安装
 ├── file_util.py             # 代码持久化工具
 ├── logger.py                # Loguru 日志配置
 ├── requirements.txt         # Python 依赖列表
@@ -380,7 +448,7 @@ pip install -r requirements.txt
 
 ### Q: 如何切换不同的 LLM 模型？
 
-修改 `.env` 中的 `SILICONFLOW_BASE_URL` 和 `SILICONFLOW_MODEL`：
+修改 `.env` 中的 `LLM_BASE_URL` 和 `LLM_MODEL`：
 
 - **DeepSeek 官方**：`https://api.deepseek.com/v1`
 - **OpenAI**：`https://api.openai.com/v1`
@@ -389,9 +457,29 @@ pip install -r requirements.txt
 ### Q: 生成的代码保存在哪里？
 
 所有代码自动保存在 `auto_generated_code/` 目录下：
+
 - `iter_00_*.py` — 首版代码
 - `iter_01_*.py` ~ `iter_05_*.py` — 各轮修复版本
 - `code_*_final.py` — 最终结果
+
+Web 界面中可以直接点击“运行生成的代码”重新执行最终文件。
+
+### Q: 生成的 PyQt6 / Qt 程序提示找不到字体？
+
+Qt 6 不再自带字体。如果你运行生成的 PyQt6 代码时看到：
+
+```text
+QFontDatabase: Cannot find font directory .../PyQt6/Qt6/lib/fonts.
+```
+
+最快的解决方式是运行前指定系统字体目录：
+
+```powershell
+$env:QT_QPA_FONTDIR="C:\Windows\Fonts"
+python auto_generated_code\code_xxxxxx_final.py
+```
+
+或者创建 PyQt6 的字体目录并复制几个 `.ttf` 字体进去（如 `msyh.ttc`）。
 
 ---
 

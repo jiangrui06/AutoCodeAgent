@@ -1,6 +1,5 @@
 """代码持久化工具 — 自动保存到本地并记录版本历史"""
 
-import os
 from datetime import datetime
 from pathlib import Path
 
