@@ -28,10 +28,27 @@ from openhands_adapter import (
 
 
 class WebUiStructureTests(unittest.TestCase):
+    def test_runtime_panel_shows_openhands_continuation_budget(self) -> None:
+        with (
+            patch.object(app_web.settings, "agent_engine", "openhands"),
+            patch.object(app_web.settings, "openhands_max_iterations", 40),
+            patch.object(app_web.settings, "openhands_auto_continue_limit", 2),
+        ):
+            html = app_web._runtime_panel_html()
+
+        self.assertIn("40 步", html)
+        self.assertIn("自动续跑", html)
+        self.assertIn("2 次", html)
+
     def test_build_demo_contains_primary_workbench_controls(self) -> None:
         self.assertTrue(callable(app_web.build_demo))
         config = app_web.demo.get_config_file()
         components = config["components"]
+        permission_component = next(
+            component
+            for component in components
+            if component.get("props", {}).get("elem_id") == "permission-level"
+        )
 
         labels = {
             component.get("props", {}).get("label")
@@ -51,6 +68,12 @@ class WebUiStructureTests(unittest.TestCase):
         self.assertIn("刷新文件", values)
         self.assertIn("允许本次操作", values)
         self.assertIn("拒绝并停止", values)
+        self.assertEqual(permission_component["props"]["value"], "trusted")
+        self.assertFalse(permission_component["props"]["interactive"])
+        self.assertIn(
+            ("信任模式 · 自动允许全部工具与依赖安装", "trusted"),
+            permission_component["props"]["choices"],
+        )
 
     def test_session_and_pending_permission_use_browser_persistent_state(self) -> None:
         config = app_web.demo.get_config_file()
@@ -281,6 +304,33 @@ class WebAgentFlowTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._engine_patch.stop()
+
+    def test_trusted_mode_inspects_existing_directory_without_openhands(self) -> None:
+        requested = Path("D:/简历")
+        with (
+            patch("config.Settings.validate_llm_config"),
+            patch("app_web.get_memory_store", return_value=None),
+            patch("app_web.find_requested_directory", return_value=requested) as find,
+            patch(
+                "app_web.summarize_directory",
+                return_value="## 本地文件夹分析完成\n\n- 81 个项目",
+            ) as summarize,
+            patch("app_web.route_user_request") as route,
+            patch("app_web.execute_openhands_task") as execute_openhands,
+        ):
+            result = list(
+                app_web.run_agent(
+                    "D:/简历 分析一下这个文件夹下面的内容",
+                    session_id="directory-session",
+                    permission_level="trusted",
+                )
+            )
+
+        find.assert_called_once()
+        summarize.assert_called_once_with(requested)
+        route.assert_not_called()
+        execute_openhands.assert_not_called()
+        self.assertIn("81 个项目", result[-1][0])
 
     @patch("config.Settings.validate_llm_config")
     @patch("app_web.get_memory_store", return_value=None)
@@ -726,10 +776,10 @@ class WebAgentFlowTests(unittest.TestCase):
             )
 
         final_message, pending_context, *_rest = result[-1]
-        self.assertIn("权限策略已阻止执行", final_message)
-        self.assertIn("无法安全确定", final_message)
+        self.assertIn("执行前权限确认", final_message)
+        self.assertIn("未审核，不能自动安装", final_message)
         self.assertNotIn("切换到“询问模式”", final_message)
-        self.assertEqual(pending_context, "")
+        self.assertTrue(pending_context.startswith("execution-permission:"))
         executor.assert_not_called()
 
     def test_execution_approval_resumes_the_exact_generated_code(self) -> None:
@@ -809,7 +859,7 @@ class WebAgentFlowTests(unittest.TestCase):
         self.assertNotIn("执行前权限确认", combined)
         self.assertIn("任务完成", combined)
 
-    def test_trusted_level_auto_installs_only_allowlisted_dependency(self) -> None:
+    def test_trusted_web_mode_overrides_stale_ask_and_auto_installs_dependency(self) -> None:
         with (
             patch("config.Settings.validate_llm_config"),
             patch("app_web.get_memory_store", return_value=None),
@@ -827,11 +877,21 @@ class WebAgentFlowTests(unittest.TestCase):
             patch("app_web.save_code_to_file", return_value="trusted.py"),
             patch("dependency_manager.importlib.util.find_spec", return_value=None),
         ):
-            result = list(app_web.run_agent("写一个 PyQt5 界面", permission_level="trusted"))
+            with patch.object(app_web.settings, "web_default_permission_level", "trusted"):
+                result = list(
+                    app_web._run_with_web_permission_policy(
+                        "写一个 PyQt5 界面",
+                        "",
+                        "trusted-session",
+                        "ask",
+                    )
+                )
 
         combined = "\n".join(item[0] for item in result)
-        install.assert_called_once_with("PyQt5")
-        self.assertIn("自动安装白名单依赖 PyQt5", combined)
+        install.assert_called_once()
+        self.assertEqual(install.call_args.args[:1], ("PyQt5",))
+        self.assertEqual(install.call_args.kwargs.get("allow_unknown"), True)
+        self.assertIn("自动安装依赖 PyQt5", combined)
         self.assertNotIn("执行前权限确认", combined)
         self.assertIn("任务完成", combined)
 
@@ -856,7 +916,9 @@ class WebAgentFlowTests(unittest.TestCase):
             result = list(app_web.run_agent("允许安装", pending))
 
         combined = "\n".join(item[0] for item in result)
-        install.assert_called_once_with("PyQt5")
+        install.assert_called_once()
+        self.assertEqual(install.call_args.args, ("PyQt5",))
+        self.assertFalse(install.call_args.kwargs.get("allow_unknown", False))
         self.assertIn("正在安装 PyQt5", combined)
         self.assertIn("任务完成", combined)
 

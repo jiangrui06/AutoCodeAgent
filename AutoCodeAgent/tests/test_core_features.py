@@ -54,6 +54,45 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(config.is_llm_configured)
         self.assertEqual(config.base_url, "https://example.test/v1")
 
+    def test_openhands_runtime_selection_requires_openhands_not_only_loguru(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_dir = root / "AutoCodeAgent" / "AutoCodeAgent"
+            sdk_python = (
+                root
+                / "software-agent-sdk"
+                / ".venv"
+                / "Scripts"
+                / "python.exe"
+            )
+            project_python = (
+                root / "AutoCodeAgent" / ".venv" / "Scripts" / "python.exe"
+            )
+            sdk_site_packages = sdk_python.parents[1] / "Lib" / "site-packages"
+            project_site_packages = project_python.parents[1] / "Lib" / "site-packages"
+            sdk_site_packages.mkdir(parents=True)
+            project_site_packages.mkdir(parents=True)
+            sdk_python.parent.mkdir(parents=True)
+            project_python.parent.mkdir(parents=True)
+            sdk_python.touch()
+            project_python.touch()
+            (sdk_site_packages / "openhands_sdk-1.36.1.dist-info").mkdir()
+            (sdk_site_packages / "openhands_tools-1.36.1.dist-info").mkdir()
+            (project_site_packages / "loguru").mkdir()
+
+            config = Settings(
+                llm_api_key="sk-test-key-1234567890",
+                openhands_python=None,
+                _env_file=None,
+            )
+            with (
+                patch("config.PROJECT_DIR", project_dir),
+                patch("config.sys.executable", str(project_python)),
+            ):
+                selected = config.effective_openhands_python
+
+        self.assertEqual(selected, sdk_python)
+
 
 class RoutingTests(unittest.TestCase):
     def test_fallback_router_separates_chat_code_and_ambiguous_input(self) -> None:
@@ -409,7 +448,7 @@ changed = True
             "auto_install",
         )
 
-    def test_sensitive_tools_are_listed_and_still_ask_in_trusted_mode(self) -> None:
+    def test_sensitive_tools_are_listed_and_still_allow_in_trusted_mode(self) -> None:
         code = (
             "import requests\n"
             "from pathlib import Path\n"
@@ -423,10 +462,34 @@ changed = True
         self.assertEqual(capability_keys, {"network", "filesystem_write"})
         self.assertEqual(
             dependency_manager.decide_permission_action(report, "trusted").action,
-            "ask",
+            "allow",
         )
 
-    def test_permission_report_names_camera_and_exact_file_operations(self) -> None:
+    def test_trusted_mode_skips_permissions_when_security_risks_present(self) -> None:
+        code = "import os\nos.system('echo hello')\n"
+        report = dependency_manager.inspect_code_permissions(code)
+        self.assertTrue(scan_code(code).findings)
+        self.assertEqual(
+            dependency_manager.decide_permission_action(
+                report,
+                "trusted",
+                has_security_findings=True,
+            ).action,
+            "allow",
+        )
+
+    def test_trusted_mode_auto_installs_unknown_dependencies(self) -> None:
+        with patch("dependency_manager.importlib.util.find_spec", return_value=None):
+            report = dependency_manager.inspect_code_permissions("import mystery_lib\n")
+
+        decision = dependency_manager.decide_permission_action(report, "trusted")
+        self.assertEqual(decision.action, "auto_install")
+        self.assertEqual(report.missing_dependencies, (MissingDependency("mystery_lib", None),))
+
+    @patch("dependency_manager.subprocess.run")
+    def test_permission_report_names_camera_and_exact_file_operations(
+        self, _run
+    ) -> None:
         code = (
             "from pathlib import Path\n"
             "import cv2\n"
@@ -509,6 +572,23 @@ changed = True
         self.assertFalse(rejected.success)
         command = run.call_args.args[0]
         self.assertIn("PyQt5", command)
+        self.assertIs(run.call_args.kwargs["shell"], False)
+
+    @patch("dependency_manager.subprocess.run")
+    @patch("dependency_manager.importlib.util.find_spec", return_value=None)
+    def test_dependency_installer_allows_unknown_in_trusted_mode(self, find_spec, run) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Successfully installed unknown-lib",
+            stderr="",
+        )
+        with patch("dependency_manager._probe_module_import", return_value=(True, "")):
+            result = install_dependency("unknown-lib", allow_unknown=True)
+
+        self.assertTrue(result.success)
+        command = run.call_args.args[0]
+        self.assertIn("unknown-lib", command)
         self.assertIs(run.call_args.kwargs["shell"], False)
 
     def test_dependency_install_requires_post_install_import_verification(self) -> None:

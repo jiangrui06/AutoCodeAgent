@@ -35,6 +35,7 @@ from dependency_manager import (
     PERMISSION_LEVEL_ASK,
     PERMISSION_LEVEL_CHOICES,
     PERMISSION_LEVEL_RESTRICTED,
+    PERMISSION_LEVEL_TRUSTED,
     code_fingerprint,
     create_execution_permission_context,
     create_install_context,
@@ -59,6 +60,11 @@ from graph_nodes import (
     planner_node,
 )
 from logger import logger
+from local_directory_inspector import (
+    find_requested_directory,
+    is_directory_inspection_request,
+    summarize_directory,
+)
 from memory_store import get_memory_store
 from openhands_adapter import (
     OPENHANDS_PERMISSION_PREFIX,
@@ -320,6 +326,30 @@ def _permission_actions_update(pending_context: str):
     return gr.update(visible=visible)
 
 
+def _resolve_runtime_permission_level(
+    requested_permission_level: str,
+    *,
+    force_default_when_trusted: bool = False,
+) -> str:
+    """归一化并解析权限等级。
+
+    如果开启“信任模式”作为全局默认，则将未显式的“ask”收敛为 trusted，
+    避免历史界面状态或按钮值导致仍走询问链路。
+    """
+    default_level = normalize_permission_level(str(settings.web_default_permission_level))
+    permission_level = normalize_permission_level(requested_permission_level)
+    if force_default_when_trusted and default_level == PERMISSION_LEVEL_TRUSTED:
+        if permission_level != PERMISSION_LEVEL_TRUSTED:
+            logger.info(
+                "信任模式全局覆盖: raw={} default={} -> trusted",
+                requested_permission_level or "settings-default",
+                default_level,
+            )
+            return PERMISSION_LEVEL_TRUSTED
+        return permission_level
+    return permission_level or default_level
+
+
 def _restore_browser_permission_state(pending_context: str):
     """页面刷新后恢复有效的待审批卡片，但绝不自动批准。"""
     openhands_request = parse_openhands_permission_context(pending_context)
@@ -387,7 +417,20 @@ def _respond_to_pending_permission(
             current_path,
         )
         return
-    yield from run_agent(response, pending_context, session_id, permission_level)
+    yield from run_agent(
+        response,
+        pending_context,
+        session_id,
+        permission_level=_resolve_runtime_permission_level(
+            permission_level,
+            force_default_when_trusted=True,
+        ),
+    )
+
+
+def _permission_level_auto_approve(permission_level: str) -> bool:
+    """可信任模式直接放行待确认项。"""
+    return normalize_permission_level(permission_level) == PERMISSION_LEVEL_TRUSTED
 
 
 def approve_pending_permission(
@@ -520,11 +563,30 @@ def _is_read_only_attachment_request(requirement: str) -> bool:
     )
 
 
+def _run_with_web_permission_policy(
+    requirement: str,
+    pending_context: str,
+    session_id: str,
+    permission_level: str,
+    attachments: list[str] | None = None,
+):
+    """给 Web 提交统一应用“默认信任优先”的权限策略。"""
+    yield from run_agent(
+        requirement,
+        pending_context,
+        session_id,
+        permission_level=permission_level,
+        force_default_permission_level=True,
+        attachments=attachments,
+    )
+
+
 def run_agent(
     requirement: str,
     pending_context: str = "",
     session_id: str = "",
     permission_level: str = PERMISSION_LEVEL_ASK,
+    force_default_permission_level: bool = False,
     attachments: list[str] | None = None,
 ):
     """主执行入口 — 逐步骤产生中间结果用于 Streaming 显示
@@ -538,7 +600,19 @@ def run_agent(
             return
 
         user_message = requirement.strip()
-        permission_level = normalize_permission_level(permission_level)
+        default_level = str(settings.web_default_permission_level)
+        raw_permission_level = permission_level or "settings-default"
+        permission_level = _resolve_runtime_permission_level(
+            permission_level,
+            force_default_when_trusted=force_default_permission_level,
+        )
+        if not permission_level:
+            permission_level = normalize_permission_level(default_level)
+        logger.info(
+            "权限模式已归一化: raw={} normalized={}",
+            raw_permission_level,
+            permission_level,
+        )
         install_request = parse_install_context(pending_context)
         execution_request = parse_execution_permission_context(pending_context)
         openhands_request = parse_openhands_permission_context(pending_context)
@@ -642,9 +716,17 @@ def run_agent(
         encountered_error_signatures: list[str] = []
 
         if openhands_request:
+            logger.info(
+                "OpenHands 待授权分支: permission_level={} action_count={}",
+                permission_level,
+                len(openhands_request.action_summaries),
+            )
             if is_execution_permission_denied(user_message):
                 openhands_decision = "reject"
-            elif is_execution_permission_approved(user_message):
+            elif (
+                _permission_level_auto_approve(permission_level)
+                or is_execution_permission_approved(user_message)
+            ):
                 if permission_level == PERMISSION_LEVEL_RESTRICTED:
                     message = (
                         "当前为受限模式，不能批准工具执行。"
@@ -655,6 +737,7 @@ def run_agent(
                     yield f"## 权限策略已阻止执行\n\n{message}", "", session_id, "", "", ""
                     return
                 openhands_decision = "approve"
+                logger.info("OpenHands 信任模式直接放行待确认任务")
             else:
                 actions = "\n".join(
                     f"- {item}" for item in openhands_request.action_summaries
@@ -707,7 +790,10 @@ def run_agent(
                     memory.add_entry(session_id, "assistant", message, "clarify")
                 yield f"## 已拒绝执行权限\n\n{message}", "", session_id, "", "", ""
                 return
-            if not is_execution_permission_approved(user_message):
+            if (
+                not _permission_level_auto_approve(permission_level)
+                and not is_execution_permission_approved(user_message)
+            ):
                 yield (
                     f"## 等待权限确认\n\n{permission_items}\n\n"
                     "> 请明确回复“允许执行”或“拒绝执行”。",
@@ -719,28 +805,9 @@ def run_agent(
                 )
                 return
 
-            unknown_dependencies = [
-                item.module
-                for item in permission_report.missing_dependencies
-                if item.package is None
-            ]
-            if unknown_dependencies:
-                modules = "、".join(f"`{name}`" for name in unknown_dependencies)
-                yield (
-                    "## 未审核依赖已阻止\n\n"
-                    f"以下导入没有可信的包名映射：{modules}。"
-                    "为避免供应链攻击，不会根据模型输出直接执行 pip 安装。",
-                    "",
-                    session_id,
-                    "",
-                    execution_request.code,
-                    "",
-                )
-                return
-
             for dependency in permission_report.missing_dependencies:
                 yield (
-                    f"## 正在安装 {dependency.package}\n\n"
+                    f"## 正在安装 {dependency.package or dependency.module}\n\n"
                     "已收到本次明确授权，正在当前虚拟环境安装白名单依赖。",
                     pending_context,
                     session_id,
@@ -748,7 +815,10 @@ def run_agent(
                     execution_request.code,
                     "",
                 )
-                result = install_dependency(dependency.package)
+                result = install_dependency(
+                    dependency.package or dependency.module,
+                    allow_unknown=_permission_level_auto_approve(permission_level),
+                )
                 if memory:
                     memory.add_entry(
                         session_id,
@@ -803,7 +873,10 @@ def run_agent(
                     memory.add_entry(session_id, "assistant", message, "clarify")
                 yield f"## 已取消依赖安装\n\n{message}", "", session_id, "", "", ""
                 return
-            if not is_install_approved(user_message):
+            if (
+                not _permission_level_auto_approve(permission_level)
+                and not is_install_approved(user_message)
+            ):
                 yield (
                     f"## 等待安装确认\n\n是否允许安装 `{install_request.package}`？\n\n"
                     "> 请明确回复“允许安装”或“取消安装”。",
@@ -824,7 +897,10 @@ def run_agent(
                 "",
                 "",
             )
-            install_result = install_dependency(install_request.package)
+            install_result = install_dependency(
+                install_request.package,
+                allow_unknown=_permission_level_auto_approve(permission_level),
+            )
             if memory:
                 memory.add_entry(
                     session_id,
@@ -862,6 +938,28 @@ def run_agent(
             request_preview,
             len(prepared_attachments),
         )
+        direct_directory_request = (
+            permission_level == PERMISSION_LEVEL_TRUSTED
+            and not prepared_attachments
+            and not any((install_request, execution_request, openhands_request))
+            and is_directory_inspection_request(effective_requirement)
+        )
+        if direct_directory_request:
+            requested_directory = find_requested_directory(effective_requirement)
+            if requested_directory is not None:
+                directory_summary = summarize_directory(requested_directory)
+                logger.info("本地文件夹只读分析完成: {}", requested_directory)
+                if memory:
+                    memory.add_entry(
+                        session_id,
+                        "assistant",
+                        directory_summary,
+                        "status",
+                        {"tool": "local_directory_inspector"},
+                    )
+                yield directory_summary, "", session_id, "", "", ""
+                return
+
         memory_context = memory.recall(session_id) if memory else ""
         if resume_state is None:
             decision = route_user_request(effective_requirement, memory_context)
@@ -1123,15 +1221,18 @@ def run_agent(
                 if permission_decision.action == "auto_install":
                     for dependency in permission_report.missing_dependencies:
                         yield (
-                            f"## 自动安装白名单依赖 {dependency.package}\n\n"
-                            "当前权限等级为“信任模式”，正在安装已审核的二进制依赖。",
+                            f"## 自动安装依赖 {dependency.package or dependency.module}\n\n"
+                            "当前权限等级为“信任模式”，正在安装任务所需依赖（包括未收录包）。",
                             "",
                             session_id,
                             "",
                             state.code,
                             "",
                         )
-                        result = install_dependency(dependency.package)
+                        result = install_dependency(
+                            dependency.package or dependency.module,
+                            allow_unknown=_permission_level_auto_approve(permission_level),
+                        )
                         if memory:
                             memory.add_entry(
                                 session_id,
@@ -1456,6 +1557,12 @@ def _runtime_panel_html() -> str:
         if engine == "openhands"
         else f"沙箱 {settings.sandbox_timeout} 秒"
     )
+    continuation_row = (
+        "<div><dt>自动续跑</dt>"
+        f"<dd>{settings.openhands_auto_continue_limit} 次</dd></div>"
+        if engine == "openhands"
+        else ""
+    )
     memory_state = "已开启" if settings.memory_enabled else "已关闭"
     memory_class = "is-ready" if settings.memory_enabled else "is-muted"
     return f"""
@@ -1468,6 +1575,7 @@ def _runtime_panel_html() -> str:
         <div><dt>模型</dt><dd title="{model}">{model}</dd></div>
         <div><dt>Agent 引擎</dt><dd>{engine_label}</dd></div>
         <div><dt>单轮上限</dt><dd>{retry_label}</dd></div>
+        {continuation_row}
         <div><dt>执行超时</dt><dd>{timeout_label}</dd></div>
         <div><dt>代码执行</dt><dd>隔离运行时</dd></div>
       </dl>
@@ -2460,12 +2568,18 @@ def build_demo() -> gr.Blocks:
                         )
                         permission_level = gr.Radio(
                             choices=list(PERMISSION_LEVEL_CHOICES),
-                            value=PERMISSION_LEVEL_ASK,
+                            value=normalize_permission_level(
+                                settings.web_default_permission_level
+                            ),
+                            interactive=normalize_permission_level(
+                                settings.web_default_permission_level
+                            )
+                            != PERMISSION_LEVEL_TRUSTED,
                             label="权限等级",
                             elem_id="permission-level",
                         )
                         gr.HTML(
-                            '<p class="permission-hint">信任模式首次确认后可在同等或更小权限范围内自主修复；新增依赖、工具或风险类型仍会再次询问。</p>',
+                            '<p class="permission-hint">信任模式会自动补齐缺失依赖并跳过再次逐步确认（包括未在白名单中的依赖），同时不再弹出执行/安装类权限提示。</p>',
                             padding=False,
                         )
                     gr.HTML(_runtime_panel_html(), padding=False)
@@ -2518,7 +2632,7 @@ def build_demo() -> gr.Blocks:
         )
 
         submit_event = submit_btn.click(
-            fn=run_agent,
+            fn=_run_with_web_permission_policy,
             inputs=[req_input, pending_context, session_id, permission_level, attachment_input],
             outputs=[output_box, pending_context, session_id, req_input, code_state, path_state],
             concurrency_limit=1,
@@ -2538,7 +2652,7 @@ def build_demo() -> gr.Blocks:
             show_progress="hidden",
         )
         enter_event = req_input.submit(
-            fn=run_agent,
+            fn=_run_with_web_permission_policy,
             inputs=[req_input, pending_context, session_id, permission_level, attachment_input],
             outputs=[output_box, pending_context, session_id, req_input, code_state, path_state],
             concurrency_limit=1,

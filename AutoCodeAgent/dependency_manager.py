@@ -24,7 +24,7 @@ PERMISSION_LEVEL_TRUSTED = "trusted"
 PERMISSION_LEVEL_CHOICES = (
     ("受限模式 · 禁止安装与敏感工具", PERMISSION_LEVEL_RESTRICTED),
     ("询问模式 · 每次确认（推荐）", PERMISSION_LEVEL_ASK),
-    ("信任模式 · 同权限范围内自主修复", PERMISSION_LEVEL_TRUSTED),
+    ("信任模式 · 自动允许全部工具与依赖安装", PERMISSION_LEVEL_TRUSTED),
 )
 _MISSING_MODULE_PATTERN = re.compile(
     r"ModuleNotFoundError:\s+No module named ['\"]([A-Za-z0-9_.]+)['\"]"
@@ -261,7 +261,8 @@ def inspect_code_permissions(code: str) -> CodePermissionReport:
 
 def normalize_permission_level(value: str) -> str:
     allowed = {PERMISSION_LEVEL_RESTRICTED, PERMISSION_LEVEL_ASK, PERMISSION_LEVEL_TRUSTED}
-    return value if value in allowed else PERMISSION_LEVEL_ASK
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else PERMISSION_LEVEL_ASK
 
 
 def decide_permission_action(
@@ -270,8 +271,6 @@ def decide_permission_action(
     has_security_findings: bool = False,
 ) -> PermissionDecision:
     """按最小权限原则决定继续、询问、阻止或自动安装。"""
-    if any(item.package is None for item in report.missing_dependencies):
-        return PermissionDecision("block", "存在未审核依赖")
     needs_permission = bool(
         report.missing_dependencies or report.capabilities or has_security_findings
     )
@@ -280,13 +279,18 @@ def decide_permission_action(
     level = normalize_permission_level(permission_level)
     if level == PERMISSION_LEVEL_RESTRICTED:
         return PermissionDecision("block", "当前为受限模式")
-    if (
-        level == PERMISSION_LEVEL_TRUSTED
-        and report.missing_dependencies
-        and not report.capabilities
-        and not has_security_findings
-    ):
-        return PermissionDecision("auto_install", "已启用白名单依赖自动安装")
+    if level == PERMISSION_LEVEL_TRUSTED:
+        if report.missing_dependencies:
+            return PermissionDecision(
+                "auto_install",
+                "信任模式自动安装缺失依赖（含未审核包）",
+            )
+        if has_security_findings or report.capabilities:
+            return PermissionDecision(
+                "allow",
+                "信任模式下默认允许敏感能力与执行风险，跳过逐项确认",
+            )
+        return PermissionDecision("allow", "信任模式下跳过逐项确认")
     return PermissionDecision("ask", "需要用户逐项确认")
 
 
@@ -508,16 +512,25 @@ def is_install_denied(text: str) -> bool:
     return (text or "").strip().lower() in _DENIAL_TEXTS
 
 
-def install_dependency(package: str, timeout: int = 300) -> InstallResult:
+def install_dependency(
+    package: str,
+    timeout: int = 300,
+    allow_unknown: bool = False,
+) -> InstallResult:
     """使用当前 Python 环境安装白名单依赖；永不经过 Shell。"""
     allowed_packages = set(DEPENDENCY_PACKAGE_MAP.values())
     if package not in allowed_packages:
-        return InstallResult(False, package, "该依赖不在自动安装白名单中。")
+        if not allow_unknown:
+            return InstallResult(False, package, "该依赖不在自动安装白名单中。")
+        # 允许在信任模式下安装未收录的依赖名（例如实验性模块）
+        # 直接将模块名当作 pip 包名尝试安装，安装后会复验是否可导入。
 
     module = next(
         (name for name, mapped_package in DEPENDENCY_PACKAGE_MAP.items() if mapped_package == package),
         "",
     )
+    if not module:
+        module = package
     if module and importlib.util.find_spec(module) is not None:
         verified, detail = _probe_module_import(module)
         if verified:

@@ -10,10 +10,50 @@ import sys
 from dotenv import load_dotenv
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_DIR / ".env"
+
+
+def _venv_root(python_executable: Path) -> Path:
+    """Return the virtualenv-like root path for an interpreter."""
+    executable_path = python_executable.expanduser().resolve()
+    parent = executable_path.parent
+    return parent.parent if parent.name.lower() in {"scripts", "bin"} else parent
+
+
+def _runtime_has_package(python_executable: Path, package: str) -> bool:
+    """Check whether a candidate runtime can import a package from installed site-packages."""
+    root = _venv_root(python_executable)
+    site_roots = [
+        root / "Lib" / "site-packages",
+        root / "lib" / "site-packages",
+        root / "site-packages",
+    ]
+    normalized = package.replace("-", "_")
+    for site_root in site_roots:
+        if not site_root.exists():
+            continue
+        if (site_root / package).exists() or (site_root / normalized).exists():
+            return True
+        for entry in site_root.iterdir():
+            if (
+                entry.is_dir()
+                and entry.suffix == ".dist-info"
+                and (
+                    entry.name.startswith(package + "-")
+                    or entry.name.startswith(normalized + "-")
+                )
+            ):
+                return True
+    return False
+
+
+def _runtime_has_openhands(python_executable: Path) -> bool:
+    """Return whether a runtime contains both required OpenHands distributions."""
+    return all(
+        _runtime_has_package(python_executable, package)
+        for package in ("openhands-sdk", "openhands-tools")
+    )
 
 # LangChain/LangSmith 直接读取 os.environ。override=False 确保外部注入的变量优先。
 load_dotenv(dotenv_path=ENV_FILE, override=False)
@@ -52,10 +92,16 @@ class Settings(BaseSettings):
     sandbox_timeout: int = Field(default=15, ge=1, le=600, alias="SANDBOX_TIMEOUT")
     agent_engine: str = Field(default="legacy", alias="AGENT_ENGINE")
     openhands_max_iterations: int = Field(
-        default=20,
+        default=40,
         ge=1,
         le=200,
         alias="OPENHANDS_MAX_ITERATIONS",
+    )
+    openhands_auto_continue_limit: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        alias="OPENHANDS_AUTO_CONTINUE_LIMIT",
     )
     openhands_workspace_dir: Path = Field(
         default=PROJECT_DIR / "auto_generated_code",
@@ -86,6 +132,10 @@ class Settings(BaseSettings):
     web_server_port: int = Field(default=7870, ge=1, le=65535, alias="WEB_SERVER_PORT")
     web_inbrowser: bool = Field(default=True, alias="WEB_INBROWSER")
     web_max_upload_mb: int = Field(default=10, ge=1, le=100, alias="WEB_MAX_UPLOAD_MB")
+    web_default_permission_level: str = Field(
+        default="trusted",
+        alias="WEB_DEFAULT_PERMISSION_LEVEL",
+    )
 
     # 长期记忆 / Obsidian
     memory_enabled: bool = Field(default=True, alias="MEMORY_ENABLED")
@@ -123,7 +173,9 @@ class Settings(BaseSettings):
     @property
     def effective_openhands_python(self) -> Path:
         if self.openhands_python:
-            return self.openhands_python.expanduser()
+            candidate = self.openhands_python.expanduser()
+            if candidate.is_file() and _runtime_has_openhands(candidate):
+                return candidate
         executable = "python.exe" if sys.platform == "win32" else "python"
         sibling_runtime = (
             PROJECT_DIR.parent.parent
@@ -132,7 +184,17 @@ class Settings(BaseSettings):
             / ("Scripts" if sys.platform == "win32" else "bin")
             / executable
         )
-        return sibling_runtime if sibling_runtime.exists() else Path(sys.executable)
+        project_runtime = (
+            PROJECT_DIR.parent
+            / ".venv"
+            / ("Scripts" if sys.platform == "win32" else "bin")
+            / executable
+        )
+        candidates = [sibling_runtime, project_runtime, Path(sys.executable)]
+        for candidate in candidates:
+            if candidate.is_file() and _runtime_has_openhands(candidate):
+                return candidate
+        return candidates[-1]
 
     @property
     def effective_agent_execution_python(self) -> Path:

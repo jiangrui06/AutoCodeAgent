@@ -1,0 +1,3 @@
+import dependency_manager
+print(dependency_manager.PERMISSION_LEVEL_CHOICES)
+print(dependency_manager.PERMISSION_LEVEL_RESTRICTED, dependency_manager.PERMISSION_LEVEL_ASK, dependency_manager.PERMISSION_LEVEL_TRUSTED)

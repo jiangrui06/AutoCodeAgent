@@ -15,11 +15,14 @@ from unittest.mock import patch
 from openhands_adapter import (
     OPENHANDS_PERMISSION_PREFIX,
     OpenHandsRunResult,
+    _ReadOnlyLoopGuard,
     _analyze_pending_actions,
+    _build_openhands_user_message,
     _build_terminal_environment,
     _event_preview,
     _latest_artifact,
     _run_worker,
+    _verification_evidence,
     _workspace_snapshot,
     build_openhands_llm_config,
     create_openhands_permission_context,
@@ -34,6 +37,138 @@ from openhands_adapter import (
 
 
 class OpenHandsAdapterContractTests(unittest.TestCase):
+    def test_same_file_read_budget_detects_read_only_loop(self) -> None:
+        guard = _ReadOnlyLoopGuard(limit=3)
+        read_event = SimpleNamespace(
+            tool_name="terminal",
+            action=SimpleNamespace(
+                command='Get-Content "C:\\workspace\\page.html" -Encoding UTF8'
+            ),
+        )
+
+        self.assertFalse(guard.observe(read_event))
+        self.assertFalse(guard.observe(read_event))
+        self.assertTrue(guard.observe(read_event))
+        self.assertTrue(guard.triggered)
+        self.assertEqual(guard.max_reads, 3)
+
+    def test_file_edit_resets_same_file_read_budget(self) -> None:
+        guard = _ReadOnlyLoopGuard(limit=3)
+        read_event = SimpleNamespace(
+            tool_name="file_editor",
+            action=SimpleNamespace(command="view", path="C:\\workspace\\page.html"),
+        )
+        edit_event = SimpleNamespace(
+            tool_name="file_editor",
+            action=SimpleNamespace(
+                command="str_replace",
+                path="C:\\workspace\\page.html",
+            ),
+        )
+
+        self.assertFalse(guard.observe(read_event))
+        self.assertFalse(guard.observe(read_event))
+        self.assertFalse(guard.observe(edit_event))
+        self.assertFalse(guard.observe(read_event))
+        self.assertFalse(guard.observe(read_event))
+        self.assertFalse(guard.triggered)
+
+    @patch("openhands_adapter._create_conversation")
+    def test_in_process_run_pauses_when_same_file_read_budget_is_exhausted(
+        self, create_conversation
+    ) -> None:
+        state = SimpleNamespace(
+            execution_status=SimpleNamespace(value="running"),
+            events=[],
+        )
+        conversation = _FakeConversation(state)
+        create_conversation.return_value = (conversation, Path.cwd())
+
+        def emit_repeated_reads() -> None:
+            callback = create_conversation.call_args.kwargs["callbacks"][0]
+            for _ in range(12):
+                callback(
+                    SimpleNamespace(
+                        tool_name="file_editor",
+                        action=SimpleNamespace(
+                            command="view",
+                            path="C:\\workspace\\page.html",
+                        ),
+                    )
+                )
+
+        conversation.on_run = emit_repeated_reads
+
+        result = execute_openhands_task(
+            "优化这个 HTML 页面",
+            "read-budget-session",
+            "ask",
+            source=SimpleNamespace(),
+        )
+
+        self.assertEqual(result.status, "stuck")
+        self.assertTrue(result.read_only_loop)
+        self.assertEqual(result.read_only_action_count, 12)
+        self.assertEqual(conversation.pause_count, 1)
+
+    def test_code_task_message_requires_testing_before_completion(self) -> None:
+        message = _build_openhands_user_message(
+            "优化这个 HTML 页面",
+            (),
+            SimpleNamespace(),
+        )
+
+        self.assertIsInstance(message, str)
+        self.assertIn("优化这个 HTML 页面", message)
+        self.assertIn("完成标准", message)
+        self.assertIn("运行与改动相关的测试或验证命令", message)
+        self.assertIn("测试或验证失败时继续修复", message)
+        self.assertIn("不得仅修改文件后就宣布完成", message)
+
+    def test_line_count_is_not_accepted_as_test_evidence(self) -> None:
+        line_count = SimpleNamespace(
+            tool_name="terminal",
+            observation=SimpleNamespace(
+                command="Get-Content page.html | Measure-Object -Line",
+                exit_code=0,
+                timeout=False,
+            ),
+        )
+        actual_test = SimpleNamespace(
+            tool_name="terminal",
+            observation=SimpleNamespace(
+                command="python -m unittest discover -s tests",
+                exit_code=0,
+                timeout=False,
+            ),
+        )
+        later_edit = SimpleNamespace(
+            tool_name="file_editor",
+            action=SimpleNamespace(command="str_replace"),
+        )
+        direct_smoke_run = SimpleNamespace(
+            tool_name="terminal",
+            observation=SimpleNamespace(
+                command="python generated_app.py",
+                exit_code=0,
+                timeout=False,
+            ),
+        )
+
+        self.assertEqual(_verification_evidence((line_count,)), (False, False))
+        self.assertEqual(
+            _verification_evidence((line_count, actual_test)),
+            (True, True),
+        )
+        self.assertEqual(
+            _verification_evidence((actual_test, later_edit)),
+            (True, False),
+        )
+        self.assertEqual(
+            _verification_evidence((direct_smoke_run,)),
+            (True, True),
+        )
+
     def test_terminal_environment_pins_python_and_pip_to_project_runtime(self) -> None:
         execution_python = Path(sys.executable).resolve()
         source = SimpleNamespace(effective_agent_execution_python=execution_python)
@@ -211,7 +346,9 @@ class OpenHandsAdapterContractTests(unittest.TestCase):
                 source=SimpleNamespace(),
             )
 
-        self.assertEqual(conversation.sent, ["修复并运行测试"])
+        self.assertEqual(len(conversation.sent), 1)
+        self.assertIn("修复并运行测试", conversation.sent[0])
+        self.assertIn("完成标准", conversation.sent[0])
         self.assertEqual(conversation.run_count, 1)
         self.assertTrue(conversation.closed)
         self.assertEqual(result.status, "waiting_for_confirmation")
@@ -284,6 +421,221 @@ class OpenHandsAdapterContractTests(unittest.TestCase):
         self.assertIn("different command", result.markdown)
         self.assertTrue(result.pending_context.startswith(OPENHANDS_PERMISSION_PREFIX))
 
+    @patch("openhands_adapter._run_worker")
+    @patch("openhands_adapter._create_conversation")
+    def test_trusted_mode_auto_approves_waiting_actions(
+        self, create_conversation, run_worker
+    ) -> None:
+        waiting = OpenHandsRunResult(
+            status="waiting_for_confirmation",
+            markdown="Need approval",
+            action_summaries=("terminal:python -m unittest",),
+        )
+        finished = OpenHandsRunResult(status="finished", markdown="done")
+        create_conversation.return_value = (
+            _FakeConversation(
+                state=SimpleNamespace(
+                    execution_status=SimpleNamespace(value="waiting_for_confirmation"),
+                    events=(SimpleNamespace(),),
+                )
+            ),
+            Path.cwd(),
+        )
+        run_worker.side_effect = [waiting, finished]
+
+        result = execute_openhands_task(
+            "run trusted task",
+            "session-one",
+            "trusted",
+            decision="start",
+        )
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(run_worker.call_count, 2)
+        first_payload = run_worker.call_args_list[0].args[0]
+        second_payload = run_worker.call_args_list[1].args[0]
+        self.assertEqual(first_payload["decision"], "start")
+        self.assertEqual(second_payload["decision"], "approve")
+        self.assertEqual(second_payload["expected_action_summaries"], ["terminal:python -m unittest"])
+
+    @patch("openhands_adapter._run_worker")
+    @patch("openhands_adapter._create_conversation")
+    def test_trusted_mode_keeps_auto_approving_until_no_waiting(
+        self, create_conversation, run_worker
+    ) -> None:
+        waiting_1 = OpenHandsRunResult(
+            status="waiting_for_confirmation",
+            markdown="Need approval first",
+            action_summaries=("terminal:pytest -q",),
+        )
+        waiting_2 = OpenHandsRunResult(
+            status="waiting_for_confirmation",
+            markdown="Need approval second",
+            action_summaries=("terminal:pytest -q --maxfail=1",),
+        )
+        finished = OpenHandsRunResult(status="finished", markdown="done")
+        create_conversation.return_value = (
+            _FakeConversation(
+                state=SimpleNamespace(
+                    execution_status=SimpleNamespace(value="waiting_for_confirmation"),
+                    events=(SimpleNamespace(),),
+                )
+            ),
+            Path.cwd(),
+        )
+        run_worker.side_effect = [waiting_1, waiting_2, finished]
+
+        result = execute_openhands_task(
+            "run trusted multi-step task",
+            "session-one",
+            "trusted",
+            decision="start",
+        )
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(run_worker.call_count, 3)
+        self.assertEqual(run_worker.call_args_list[0].args[0]["decision"], "start")
+        self.assertEqual(run_worker.call_args_list[1].args[0]["decision"], "approve")
+        self.assertEqual(run_worker.call_args_list[1].args[0]["expected_action_summaries"], ["terminal:pytest -q"])
+        self.assertEqual(run_worker.call_args_list[2].args[0]["decision"], "approve")
+        self.assertEqual(run_worker.call_args_list[2].args[0]["expected_action_summaries"], ["terminal:pytest -q --maxfail=1"])
+
+    @patch("openhands_adapter._run_worker")
+    def test_trusted_mode_continues_after_iteration_limit_and_runs_to_completion(
+        self, run_worker
+    ) -> None:
+        exhausted = OpenHandsRunResult(
+            status="error",
+            markdown="OpenHands 执行未完成: MaxIterationsReached",
+            error="Agent reached maximum iterations limit (20).",
+        )
+        finished = OpenHandsRunResult(status="finished", markdown="tests passed")
+        run_worker.side_effect = [exhausted, finished]
+        result = execute_openhands_task(
+            "优化这个 HTML 页面",
+            "session-one",
+            "trusted",
+            source=None,
+        )
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(run_worker.call_count, 2)
+        second_payload = run_worker.call_args_list[1].args[0]
+        self.assertEqual(second_payload["decision"], "start")
+        self.assertIn("上一次运行达到了单轮步数上限", second_payload["requirement"])
+        self.assertIn("优先运行测试或验证", second_payload["requirement"])
+        self.assertEqual(second_payload["image_paths"], [])
+
+    @patch("openhands_adapter._run_worker")
+    def test_trusted_mode_stops_after_bounded_iteration_limit_retries(
+        self, run_worker
+    ) -> None:
+        exhausted = OpenHandsRunResult(
+            status="error",
+            markdown="MaxIterationsReached",
+            error="maximum iterations limit",
+        )
+        run_worker.side_effect = [exhausted, exhausted, exhausted]
+
+        with patch(
+            "openhands_adapter._configured_auto_continue_limit",
+            return_value=2,
+        ):
+            result = execute_openhands_task(
+                "优化这个 HTML 页面",
+                "session-one",
+                "trusted",
+            )
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(run_worker.call_count, 3)
+
+    @patch("openhands_adapter._run_worker")
+    def test_trusted_mode_recovers_from_generic_stuck_without_repeating(
+        self, run_worker
+    ) -> None:
+        stuck = OpenHandsRunResult(
+            status="stuck",
+            markdown="OpenHands 执行未完成",
+            error="Agent got stuck in a repeated action loop.",
+        )
+        finished = OpenHandsRunResult(
+            status="finished",
+            markdown="已完成文件夹分析",
+        )
+        run_worker.side_effect = [stuck, finished]
+
+        result = execute_openhands_task(
+            "分析 D:/简历",
+            "stuck-recovery-session",
+            "trusted",
+        )
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(run_worker.call_count, 2)
+        recovery = run_worker.call_args_list[1].args[0]
+        self.assertEqual(recovery["decision"], "start")
+        self.assertIn("不要重复上一条命令", recovery["requirement"])
+        self.assertIn("输出为空", recovery["requirement"])
+        self.assertEqual(recovery["image_paths"], [])
+
+    @patch("openhands_adapter._run_worker")
+    def test_trusted_mode_stops_after_repeated_read_loop_recovery(
+        self, run_worker
+    ) -> None:
+        read_loop = OpenHandsRunResult(
+            status="stuck",
+            markdown="OpenHands 执行未完成",
+            error="同一文件连续只读达到预算",
+            read_only_loop=True,
+            read_only_action_count=12,
+        )
+        run_worker.side_effect = [read_loop, read_loop]
+
+        result = execute_openhands_task(
+            "优化这个 HTML 页面",
+            "read-loop-session",
+            "trusted",
+        )
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(run_worker.call_count, 2)
+        recovery = run_worker.call_args_list[1].args[0]
+        self.assertIn("禁止继续分片读取", recovery["requirement"])
+        self.assertIn("必须立即修改", recovery["requirement"])
+        self.assertIn("只读循环", result.markdown)
+
+    @patch("openhands_adapter._run_worker")
+    def test_trusted_mode_requires_verification_after_edit_only_completion(
+        self, run_worker
+    ) -> None:
+        edit_only = OpenHandsRunResult(
+            status="finished",
+            markdown="file edited",
+            saved_path="C:/workspace/page.html",
+            verification_required=True,
+            verification_passed=False,
+        )
+        verified = OpenHandsRunResult(
+            status="finished",
+            markdown="browser check passed",
+            verification_passed=True,
+        )
+        run_worker.side_effect = [edit_only, verified]
+
+        result = execute_openhands_task(
+            "优化这个 HTML 页面",
+            "verification-session",
+            "trusted",
+        )
+
+        self.assertEqual(result.status, "finished")
+        self.assertTrue(result.verification_passed)
+        self.assertEqual(run_worker.call_count, 2)
+        continuation = run_worker.call_args_list[1].args[0]
+        self.assertIn("尚未提供测试通过证据", continuation["requirement"])
+        self.assertIn("必须立即运行", continuation["requirement"])
+
     def test_rejection_records_observation_without_running_pending_action(self) -> None:
         state = SimpleNamespace(
             execution_status=SimpleNamespace(value="waiting_for_confirmation"),
@@ -313,6 +665,8 @@ class OpenHandsAdapterContractTests(unittest.TestCase):
             status="finished",
             markdown="完成",
             event_count=3,
+            read_only_loop=True,
+            read_only_action_count=12,
         )
         run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -333,6 +687,8 @@ class OpenHandsAdapterContractTests(unittest.TestCase):
 
         self.assertEqual(result.status, "finished")
         self.assertEqual(result.event_count, 3)
+        self.assertTrue(result.read_only_loop)
+        self.assertEqual(result.read_only_action_count, 12)
         kwargs = run.call_args.kwargs
         self.assertFalse(kwargs["shell"])
         self.assertEqual(json.loads(kwargs["input"]), {"requirement": "测试"})
@@ -434,7 +790,10 @@ class OpenHandsAdapterContractTests(unittest.TestCase):
                 )
 
         build_message.assert_called_once_with(
-            "describe image", (str(Path("C:/uploads/probe.png")),), SimpleNamespace()
+            "describe image",
+            (str(Path("C:/uploads/probe.png")),),
+            SimpleNamespace(),
+            require_verification=False,
         )
         self.assertEqual(conversation.sent, [multimodal_message])
         self.assertEqual(result.status, "finished")
@@ -469,6 +828,7 @@ class _FakeConversation:
         self.run_count = 0
         self.rejections = []
         self.closed = False
+        self.pause_count = 0
 
     def send_message(self, message):
         self.sent.append(message)
@@ -480,6 +840,9 @@ class _FakeConversation:
 
     def reject_pending_actions(self, reason):
         self.rejections.append(reason)
+
+    def pause(self):
+        self.pause_count += 1
 
     def close(self):
         self.closed = True
